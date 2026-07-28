@@ -7,8 +7,10 @@
 
 # --- Pasta de dados de runtime (chaves, logs, estado, metricas, .env) ---
 # data/ nasce sozinha em runtime e guarda tudo sensivel. Nada dela entra
-# no repo — nem o .env.example (que e mantido a parte, abaixo).
-data/
+# no repo, EXCETO o .env.example (mantido a parte, abaixo).
+# IMPORTANTE: usar data/* (nao data/) — o git nao permite re-incluir um
+# arquivo se o diretorio pai foi excluido com barra final.
+data/*
 !data/.env.example
 
 # --- Arquivos de ambiente (defesa em profundida, caso soltem na raiz) ---

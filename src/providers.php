@@ -25,7 +25,7 @@ function call_provider(array $provider, array $payload, ?callable $onChunk): arr
     $status = 0;
     $body   = '';
 
-    $ch = curl_init();
+    $ch = curl_acquire($endpoint);
     curl_setopt_array($ch, [
         CURLOPT_URL            => $endpoint,
         CURLOPT_POST           => true,
@@ -72,9 +72,58 @@ function call_provider(array $provider, array $payload, ?callable $onChunk): arr
 
     $ok    = curl_exec($ch);
     $error = $ok === false ? curl_error($ch) : '';
-    curl_close($ch);
+    curl_release($endpoint, $ch);
 
     return ['status' => $status, 'body' => $body, 'error' => $error];
+}
+
+/**
+ * Pool de handles curl por host, reutilizando conexao TCP+TLS entre
+ * requisicoes para o mesmo provedor. O handle e "emprestado" e devolvido
+ * apos o uso; nunca fica retido por duas chamadas simultaneas. Em SAPI
+ * nao-persistente (php -S, CGI) o pool vive so na requisicao — ainda
+ * assim economiza handshakes quando o mesmo provedor e tentado mais de
+ * uma vez (retry no mesmo provedor, fallback). Em PHP-FPM o pool e
+ * descartado a cada request, mas o SO reusa a conexao via keep-alive HTTP.
+ */
+function curl_acquire(string $endpoint): CurlHandle
+{
+    $host = parse_url($endpoint, PHP_URL_HOST) ?: $endpoint;
+    $pool = &curl_pool();
+    if (isset($pool[$host]) && $pool[$host] !== null) {
+        $handle = $pool[$host];
+        $pool[$host] = null; // marca como emprestado
+        curl_reset($handle);
+        return $handle;
+    }
+    $handle = curl_init();
+    $pool[$host] = null; // registra o slot mesmo antes de devolver
+    return $handle;
+}
+
+function curl_release(string $endpoint, CurlHandle $handle): void
+{
+    $host = parse_url($endpoint, PHP_URL_HOST) ?: $endpoint;
+    $pool = &curl_pool();
+    // So guarda se o slot existe (handle criado por curl_acquire) —
+    // evita acumular handles de callers que nao usaram o pool.
+    if (array_key_exists($host, $pool) && $pool[$host] === null) {
+        $pool[$host] = $handle;
+    } else {
+        curl_close($handle);
+    }
+}
+
+/**
+ * Detentor unico do pool de handles por host. As duas funcoes acima
+ * pegam uma referencia a este array estatico — sem isso, cada funcao
+ * teria seu proprio $pool independente e o release nunca veria o slot
+ * registrado pelo acquire (bug classico de static em funcoes separadas).
+ */
+function &curl_pool(): array
+{
+    static $pool = [];
+    return $pool;
 }
 
 function provider_headers(array $provider): array
@@ -130,6 +179,10 @@ function upstream_message(string $body): string
     }
     $message = preg_replace('/\s+/', ' ', $message) ?? '';
     $message = redact_secrets($message);
+    // Defesa em profundidade: a resposta e application/json (json_encode escapa
+    // aspas), mas se o cliente renderizar o campo em HTML, &lt;script&gt; nao
+    // executa. strip_tags acima ja removeu tags; isto escapa o que restou.
+    $message = htmlspecialchars($message, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     return function_exists('mb_substr') ? mb_substr($message, 0, 180) : substr($message, 0, 180);
 }
 
@@ -158,6 +211,13 @@ function redact_secrets(string $text): string
  */
 function all_configured_keys(): array
 {
+    // A config nao muda dentro de uma requisicao (e define()). Cache estatico
+    // evita revarrer todo MODELS a cada log/error — redact_secrets e chamado
+    // em toda tentativa e em cada mensagem de erro do provedor.
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
     $keys = [];
     foreach (MODELS as $config) {
         $entries = is_array($config['providers'] ?? null) ? $config['providers'] : $config;
@@ -165,5 +225,6 @@ function all_configured_keys(): array
             $keys[] = (string) ($entry['key'] ?? '');
         }
     }
-    return array_values(array_unique(array_filter($keys, static fn (string $key): bool => strlen($key) >= 8)));
+    $cache = array_values(array_unique(array_filter($keys, static fn (string $key): bool => strlen($key) >= 8)));
+    return $cache;
 }

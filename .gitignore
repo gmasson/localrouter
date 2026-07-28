@@ -1,0 +1,45 @@
+# =====================================================================
+# LocalRouter — .gitignore
+# Tudo que nao deve ser versionado: chaves, logs, estado, metricas e
+# arquivos locais de IDE/SO. O codigo (config.php, src/, README, Docker)
+# E versionado; os dados de runtime NAO.
+# =====================================================================
+
+# --- Pasta de dados de runtime (chaves, logs, estado, metricas, .env) ---
+# data/ nasce sozinha em runtime e guarda tudo sensivel. Nada dela entra
+# no repo — nem o .env.example (que e mantido a parte, abaixo).
+data/
+!data/.env.example
+
+# --- Arquivos de ambiente (defesa em profundida, caso soltem na raiz) ---
+.env
+.env.*
+!.env.example
+
+# --- Logs soltos na raiz (legado) ---
+*.log
+*.log.*
+
+# --- Estado / metricas soltos na raiz (legado) ---
+state.json
+metrics.json
+logs.db
+logs.db-*
+*.sqlite
+*.sqlite-*
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# --- SO ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Docker volumes locais (se alguem rodar compose e gerar aqui) ---
+.docker/

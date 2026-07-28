@@ -1,0 +1,291 @@
+openapi: 3.0.3
+info:
+  title: LocalRouter
+  version: "0.2"
+  description: |
+    Gateway de IA com API no formato OpenAI e rotação automática de provedores
+    (dialetos OpenAI e Anthropic). Quando um provedor devolve erro, estoura o
+    limite de requisições ou fica sem crédito, o router passa para o próximo
+    na mesma requisição — o app que chamou não percebe a troca.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local (php -S localhost:8000)
+  - url: https://seudominio.com
+    description: Publicado
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: |
+        Uma das chaves em GATEWAY_KEYS. Enviada como
+        `Authorization: Bearer <chave>`. O cabeçalho `x-api-key` também é
+        aceito como alternativa.
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: { type: string }
+            type: { type: string }
+            code: { type: integer }
+
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: model }
+        created: { type: integer }
+        owned_by: { type: string }
+
+    ModelList:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Model' }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unconfigured, metrics_off] }
+        providers:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              total: { type: integer }
+              errors: { type: integer }
+              error_rate: { type: number }
+              status: { type: object, additionalProperties: { type: integer } }
+              p50_ms: { type: integer }
+              p95_ms: { type: integer }
+              last_at: { type: integer }
+              last_outcome: { type: string }
+
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool, developer]
+        content:
+          oneOf:
+            - { type: string }
+            - type: array
+              items:
+                type: object
+                properties:
+                  type: { type: string, enum: [text, image_url, input_audio, file] }
+                  text: { type: string }
+                  image_url:
+                    type: object
+                    properties:
+                      url: { type: string }
+                  input_audio:
+                    type: object
+                    properties:
+                      data: { type: string }
+                      format: { type: string }
+                  file:
+                    type: object
+                    properties:
+                      filename: { type: string }
+                      file_data: { type: string }
+
+    Tool:
+      type: object
+      properties:
+        type: { type: string, example: function }
+        function:
+          type: object
+          properties:
+            name: { type: string }
+            description: { type: string }
+            parameters: { type: object }
+
+    CompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string, example: gpt-oss-120b }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        stream: { type: boolean, default: false }
+        stream_options:
+          type: object
+          properties:
+            include_usage: { type: boolean }
+        temperature: { type: number, minimum: 0, maximum: 2 }
+        top_p: { type: number, minimum: 0, maximum: 1 }
+        top_k: { type: integer, minimum: 1 }
+        max_tokens: { type: integer, minimum: 1 }
+        max_completion_tokens: { type: integer, minimum: 1 }
+        stop:
+          oneOf:
+            - { type: string }
+            - type: array
+              items: { type: string }
+        tools:
+          type: array
+          items: { $ref: '#/components/schemas/Tool' }
+        tool_choice:
+          oneOf:
+            - { type: string, enum: [none, auto, required] }
+            - type: object
+        # Passthrough OpenAI (seed, response_format, reasoning_effort, ...)
+        # repassados intactos a provedores de dialeto openai.
+        seed: { type: integer }
+        response_format: { type: object }
+        reasoning_effort: { type: string }
+        user: { type: string }
+
+    CompletionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message:
+                type: object
+                properties:
+                  role: { type: string, example: assistant }
+                  content: { type: string, nullable: true }
+                  tool_calls:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        type: { type: string, example: function }
+                        function:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            arguments: { type: string }
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls]
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+
+security:
+  - bearer: []
+
+paths:
+  /chat/completions:
+    post:
+      summary: Cria uma completion (formato OpenAI)
+      description: |
+        Entrada e saída no formato OpenAI. Aceita `stream: true`. Provedores
+        de dialeto Anthropic são traduzidos por dentro. Em caso de falha de
+        um provedor, o router tenta o próximo automaticamente.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompletionRequest' }
+      responses:
+        '200':
+          description: Completion (não-streaming) ou início do stream SSE.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompletionResponse' }
+            text/event-stream:
+              schema: { type: string }
+        '400': { description: Corpo inválido, messages ausente. }
+        '401': { description: Chave do gateway ausente ou inválida. }
+        '404': { description: Modelo não configurado. }
+        '413': { description: Corpo acima de MAX_BODY_BYTES. }
+        '429':
+          description: Rate limit do gateway atingido.
+          headers:
+            Retry-After:
+              schema: { type: string }
+              description: Segundos restantes na janela.
+        '502': { description: Todos os provedores falharam. }
+
+  /models:
+    get:
+      summary: Lista os modelos configurados
+      responses:
+        '200':
+          description: Lista de modelos.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelList' }
+
+  /health:
+    get:
+      summary: Health check (sem autenticação)
+      description: |
+        `{"status":"ok"}` quando configurado; `503 {"status":"unconfigured"}`
+        com a chave de fábrica. Sem autenticação de propósito — o monitor
+        local nunca é barrado.
+      security: []
+      responses:
+        '200': { description: Gateway configurado. }
+        '503': { description: Gateway com chave de fábrica. }
+
+  /health/providers:
+    get:
+      summary: Health detalhado por provedor (autenticado)
+      description: |
+        Retorna por provedor: contagem por status HTTP, latência p50/p95,
+        taxa de erro, última tentativa. Exige métricas ativadas
+        (`METRICS_BACKEND != 'off'`); caso contrário devolve 503 com
+        `status: metrics_off`.
+      responses:
+        '200':
+          description: Snapshot por provedor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503': { description: Métricas desligadas. }
+
+  /metrics:
+    get:
+      summary: Métricas agregadas (autenticado, opt-in)
+      description: |
+        Contadores agregados por provedor. Formato `json` (default) ou
+        `prometheus` (text format, compatível com Prometheus/Grafana).
+        Desligado por padrão — ative com `METRICS_EXPOSE = true`.
+      parameters:
+        - in: header
+          name: Accept
+          schema: { type: string }
+          description: |
+            `application/json` (default) ou `text/plain` para Prometheus.
+            O formato também segue `METRICS_FORMAT` do config.
+      responses:
+        '200':
+          description: Métricas no formato pedido.
+          content:
+            application/json:
+              schema: { type: object }
+            text/plain:
+              schema: { type: string }
+        '404': { description: METRICS_EXPOSE desligado. }

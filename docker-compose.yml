@@ -1,0 +1,35 @@
+# LocalRouter — compose para desenvolvimento/produção local.
+# Sobe o gateway em http://localhost:8000 com a pasta data/ montada como
+# volume (persiste logs, estado, métricas e .env entre reinícios).
+#
+# Uso:
+#   docker compose up -d
+#   curl http://localhost:8000/health
+#
+# Para injetar chaves sem bakear na imagem, monte data/.env ou use
+# environment: abaixo (variável real sempre vence o .env).
+
+services:
+  localrouter:
+    build: .
+    image: localrouter:latest
+    container_name: localrouter
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persiste logs, estado, métricas e o .env entre reinícios.
+      - ./data:/app/data
+    # Exemplo de variáveis de ambiente (descomente e preencha, ou use
+    # data/.env montado pelo volume acima). Variável real vence o .env.
+    # environment:
+    #   GROQ_API_KEY: gsk_...
+    #   OPENROUTER_KEY: sk-or-...
+    #   ANTHROPIC_API_KEY: sk-ant-...
+    #   LR_GATEWAY_KEY: sk-lr-...
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "php", "-r", "echo @file_get_contents('http://localhost:8000/health') ? 0 : 1;"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -21,12 +21,13 @@ declare(strict_types=1);
  * partes na ordem certa e despacha para a web ou para a linha de comando.
  */
 
-define('LOCALROUTER', '1.0.0');
+define('LOCALROUTER', '0.2');
 
 require __DIR__ . '/config.php';
 require __DIR__ . '/src/providers.php';
 require __DIR__ . '/src/formats.php';
 require __DIR__ . '/src/streaming.php';
+require __DIR__ . '/src/metrics.php';
 require __DIR__ . '/src/gateway.php';
 
 // Terminal: utilitarios de configuracao, sem tocar na parte web.

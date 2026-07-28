@@ -232,7 +232,17 @@ function build_openai_payload(array $request, string $model): array
     $payload = ['model' => $model, 'messages' => $messages];
     $params  = $request['params'];
 
-    if ($params['max_tokens'] !== null)  { $payload['max_tokens']  = $params['max_tokens']; }
+    // Alguns provedores OpenAI-compatíveis (ex.: vLLM, LM Studio) rejeitam
+    // requisicoes sem max_tokens; outros aceitam mas geram ate o limite
+    // do contexto. FORCE_MAX_TOKENS_OPENAI garante um default explicito
+    // (DEFAULT_MAX_TOKENS) quando o cliente nao enviou o campo — evita
+    // 400 do provedor e custo imprevisto. So se aplica a provedores openai;
+    // Anthropic ja exige max_tokens obrigatorio e e tratado em build_anthropic_payload.
+    $maxTokens = $params['max_tokens'];
+    if ($maxTokens === null && FORCE_MAX_TOKENS_OPENAI) {
+        $maxTokens = DEFAULT_MAX_TOKENS;
+    }
+    if ($maxTokens !== null) { $payload['max_tokens'] = $maxTokens; }
     if ($params['temperature'] !== null) { $payload['temperature'] = $params['temperature']; }
     if ($params['top_p'] !== null)       { $payload['top_p']       = $params['top_p']; }
     if ($params['stop'] !== [])          { $payload['stop']        = $params['stop']; }

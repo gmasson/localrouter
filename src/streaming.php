@@ -27,9 +27,6 @@ interface StreamTranslator
     /** Fecha o stream (usado quando o provedor termina sem terminador proprio). */
     public function finish(): string;
 
-    /** Encerra com evento de erro apos a resposta ja ter comecado. */
-    public function abort(string $message): string;
-
     /** Texto de resposta ja emitido ao cliente (para retomar em outro provedor). */
     public function emittedText(): string;
 }
@@ -48,11 +45,6 @@ final class PassThroughStream implements StreamTranslator
     public function finish(): string
     {
         return '';
-    }
-
-    public function abort(string $message): string
-    {
-        return sse(['error' => ['type' => 'upstream_error', 'message' => $message]]) . "data: [DONE]\n\n";
     }
 
     public function emittedText(): string
@@ -219,11 +211,6 @@ final class AnthropicToOpenAiStream extends BaseTranslator
             ]);
         }
         return $output . "data: [DONE]\n\n";
-    }
-
-    public function abort(string $message): string
-    {
-        return sse(['error' => ['type' => 'upstream_error', 'message' => $message]]) . "data: [DONE]\n\n";
     }
 
     public function emittedText(): string

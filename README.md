@@ -1,4 +1,4 @@
-# LocalRouter 0.1
+# LocalRouter 0.2
 
 Gateway de IA open-source (MIT) com API **no formato OpenAI** e rotação automática de provedores — que podem falar tanto o dialeto OpenAI quanto o Anthropic. Publica um endpoint compatível com OpenAI **e** com Anthropic, e por trás dele mantém uma lista de provedores por modelo. Quando um provedor devolve erro, estoura o limite de requisições ou fica sem crédito, o router passa para o próximo na mesma requisição — o app que chamou não percebe a troca.
 
@@ -27,8 +27,10 @@ Os exemplos abaixo priorizam o uso local; quando houver diferença para o public
 8. [Tradução para provedores Anthropic](#tradução-para-provedores-anthropic)
 9. [Logs](#logs)
 10. [Segurança](#segurança)
-11. [Erros comuns](#erros-comuns)
-12. [Limitações conhecidas](#limitações-conhecidas)
+11. [Troubleshooting](#troubleshooting)
+12. [Erros comuns](#erros-comuns)
+13. [Limitações conhecidas](#limitações-conhecidas)
+14. [Docker](#docker)
 
 ---
 
@@ -58,26 +60,7 @@ Zero dependências externas. Sem Composer, sem build.
 
 ## Instalação
 
-Estrutura entregue (a mesma em localhost ou publicado):
-
-```
-raiz do projeto/
-├── robots.txt              ← no publicado, precisa ficar na raiz do domínio
-├── LICENSE                 ← MIT
-├── index.php               ← ponto de entrada (web + linha de comando)
-├── config.php              ← TODA a configuração (texto ou env)
-├── .htaccess               ← rewrite, HTTPS, bloqueio de robôs e de src/
-├── src/
-│   ├── gateway.php          ← fluxo, guards, estado, log
-│   ├── providers.php        ← chamadas HTTP aos provedores
-│   ├── formats.php          ← tradução OpenAI ↔ canônico ↔ Anthropic
-│   ├── streaming.php        ← tradutores SSE
-│   ├── cli.php              ← utilitários de linha de comando (genkey, check)
-│   └── .htaccess            ← Require all denied
-└── data/                   ← criada sozinha se cooldown/rate limit forem ativados
-```
-
-Cada arquivo de `src/` e o `config.php` morrem em silêncio se acessados sem o bootstrap (`defined('LOCALROUTER') or exit`) — segunda tranca além do `.htaccess`.
+Cada arquivo de `src/` e o `config.php` morrem em silêncio se acessados sem o bootstrap (`defined('LOCALROUTER') or exit`) — segunda tranca além do `.htaccess`. A pasta `data/` nasce sozinha quando cooldown, rate limit ou métricas são ativados, com um `.htaccess` próprio negando acesso web.
 
 ### Local (recomendado para começar)
 
@@ -100,7 +83,7 @@ Em localhost o `REQUIRE_HTTPS` é isento de propósito (o PHP detecta `127.0.0.1
 
 1. Envie os arquivos para a raiz pública do site (`public_html`, `www` ou equivalente).
 2. Envie `robots.txt` para a **raiz do domínio**. Rastreadores só leem `https://seudominio.com/robots.txt`; um `robots.txt` dentro de uma subpasta é ignorado. Quem bloqueia a pasta de fato é o cabeçalho `X-Robots-Tag`, definido no `.htaccess`.
-3. Em produção, prefira apontar `LOG_FILE` e `STATE_FILE` para **fora** do docroot (ver `config.php`) — em servidor sem `.htaccess` (Nginx) o `router.log` poderia ficar exposto.
+3. Em produção, prefira apontar `LOG_FILE` e `STATE_FILE` para **fora** do docroot (ver `config.php`) — em servidor sem `.htaccess` (Nginx) o `localrouter.log` poderia ficar exposto.
 
 ### Configurar e testar (serve para os dois)
 
@@ -138,6 +121,19 @@ O `?: ''` garante string vazia quando a env não existe — e chave vazia é sem
 
 > Por que `define()` e não `const`? `const` em PHP não aceita chamada de função — `const X = getenv(...)` é erro fatal. `define()` se comporta igual e libera o `getenv()`.
 
+#### Arquivo `.env` (opcional)
+
+Em localhost, exportar variáveis de ambiente no shell antes do `php -S` é incômodo. Se o arquivo `data/.env` existir, o `config.php` o carrega **antes** de qualquer `define()` usar `getenv('X') ?: ''`, com `parse_ini_file` (nativo, zero dependências). Variável de ambiente real (painel da hospedagem, shell) sempre tem prioridade — `.env` só preenche o que estiver vazio.
+
+```ini
+# data/.env  (NÃO versione este arquivo)
+GROQ_API_KEY=gsk_abc123
+OPENROUTER_KEY="com espaço"
+# comentário
+```
+
+Mantenha `data/.env` no `.gitignore`. O `.htaccess` já bloqueia `data/` e arquivos `.env`.
+
 ### `GATEWAY_KEYS`
 
 As chaves que **seus apps** usam para falar com o router. Não confunda com as chaves dos provedores.
@@ -159,7 +155,7 @@ Aceita várias chaves — útil para revogar o acesso de um app sem afetar os ou
 
 ### `PROVIDERS` — catálogo de URLs e dialeto
 
-Cada provedor é cadastrado **uma vez** com um nome livre, a URL base e o tipo de API (`openai` ou `anthropic`) — só isso. A chave de API fica em cada entrada de `MODELS`, porque cada modelo pode usar uma conta/chave diferente do mesmo serviço. O `type` é fixo por provedor: OpenRouter sempre fala `openai`, a API nativa da Anthropic sempre fala `anthropic`. O arquivo já vem com 21 provedores pré-preenchidos (Groq, Cerebras, OpenRouter, Google AI Studio, GitHub Models, Mistral, NVIDIA, Hugging Face, SiliconFlow, Ollama, Vercel AI Gateway, OpenCode, Cloudflare, Anthropic, OpenAI, xAI, Fireworks, Nebius, Novita, Z AI e um provedor local para Ollama na sua máquina).
+Cada provedor é cadastrado **uma vez** com um nome livre, a URL base e o tipo de API (`openai` ou `anthropic`) — só isso. A chave de API fica em cada entrada de `MODELS`, porque cada modelo pode usar uma conta/chave diferente do mesmo serviço. O `type` é fixo por provedor: OpenRouter sempre fala `openai`, a API nativa da Anthropic sempre fala `anthropic`. O arquivo já vem com 22 provedores pré-preenchidos (Groq, Cerebras, OpenRouter, Google AI Studio, GitHub Models, Mistral, NVIDIA, Hugging Face, SiliconFlow, Ollama, Vercel AI Gateway, OpenCode, OpenCode Go, Cloudflare, Anthropic, OpenAI, xAI, Fireworks, Nebius, Novita, Z AI e um provedor local para Ollama na sua máquina).
 
 ```php
 define('PROVIDERS', [
@@ -224,6 +220,21 @@ Um modelo pode fixar `temperature`, `top_p`, `top_k`, `max_tokens`, `stop` e qua
 
 A forma antiga (lista simples de provedores, sem `params`) continua válida — nesse caso valem só os padrões globais.
 
+#### `system_prompt` por modelo
+
+Um modelo pode fixar um prompt de sistema que o router injeta **antes** das mensagens do app, em toda requisição:
+
+```php
+'assistente-juridico' => [
+    'system_prompt' => 'Você é um assistente jurídico conciso. Responda em português, cite o artigo quando relevante.',
+    'providers' => [
+        ['provider' => 'groq', 'model' => 'openai/gpt-oss-120b', 'key' => getenv('GROQ_API_KEY') ?: ''],
+    ],
+],
+```
+
+Se o app também enviar mensagens `system`, o `system_prompt` do modelo vem **primeiro** e o do app é anexado em seguida — a precedência do app é mantida no conteúdo. Útil para fixar persona/regras sem obrigar todo app que usa o modelo a repetir o prompt.
+
 **Precedência**, do mais forte ao mais fraco:
 
 1. O que o app enviou na requisição
@@ -255,12 +266,22 @@ Para descobrir o que está no ar hoje, consulte a documentação do provedor (a 
 | `EXPOSE_PROVIDER_HEADER` | `true` | Devolve `X-Router-Provider`, `X-Router-Model` e `X-Router-Attempt`. Desligue se os clientes não forem seus. |
 | `MODEL_FALLBACKS` | `[]` | Fallback **entre modelos**: esgotados os provedores de um, segue nos do outro. Ex.: `['claude-sonnet' => 'gpt-oss-120b']`. |
 | `COOLDOWN_SECONDS` | `0` (off) | Provedor que falhou por limite, crédito ou 5xx fica de castigo por N segundos e nem é tentado. Exige `STATE_FILE` gravável. |
-| `RATE_LIMIT_PER_MINUTE` | `0` (off) | Teto de requisições por minuto do próprio gateway. Segura app em loop e chave vazada. |
-| `STATE_FILE` | `data/state.json` | Arquivo de estado do cooldown e do rate limit. A pasta nasce com um `.htaccess` próprio negando acesso web. |
+| `BREAKER_FAILURES` | `0` (off) | Circuit breaker formal além do cooldown. Com N falhas **consecutivas** o provedor fica "aberto" por `BREAKER_OPEN_SECONDS` e só volta via probe (1 req de teste) a cada `BREAKER_PROBE_SECONDS`. Falha de rede pura conta como 0.5. Exige `STATE_FILE`. |
+| `BREAKER_OPEN_SECONDS` | `60` | Quanto tempo o circuito fica aberto antes de permitir probe. |
+| `BREAKER_PROBE_SECONDS` | `30` | Intervalo entre probes no estado half-open. |
+| `RETRY_SAME_PROVIDER` | `0` (off) | Tentativas extras no **mesmo** provedor antes de rotacionar, apenas para falha de rede pura (timeout, DNS, conexão recusada — sem status HTTP). Nunca para 429/402 (cooldown no primeiro erro). |
+| `RATE_LIMIT_PER_MINUTE` | `0` (off) | Teto de requisições por minuto do próprio gateway. Segura app em loop e chave vazada. Ao estourar, devolve `429` com header `Retry-After` (segundos restantes na janela). |
+| `STATE_FILE` | `data/state.json` | Arquivo de estado do cooldown, circuit breaker e rate limit. A pasta nasce com um `.htaccess` próprio negando acesso web. |
+| `METRICS_BACKEND` | `'off'` | Métricas de uso por provedor: `'off'` (desligado), `'file'` (JSON rolado em `METRICS_FILE`) ou `'sqlite'` (histórico persistente em `METRICS_DB`, exige ext-pdo_sqlite; cai em `file` em silencio se faltar). |
+| `METRICS_FILE` | `data/metrics.json` | Caminho do backend file. |
+| `METRICS_DB` | `data/logs.db` | Caminho do backend sqlite. |
+| `METRICS_WINDOW_SECONDS` | `3600` | Janela rolante das métricas em memória/file (SQLite guarda histórico completo). |
+| `METRICS_EXPOSE` | `false` | Expõe `GET /metrics` (autenticado). Desligado por padrão. |
+| `METRICS_FORMAT` | `'json'` | Formato de `/metrics`: `'json'` ou `'prometheus'` (text format, compatível com Prometheus/Grafana). |
 | `ALLOWED_IPS` | `[]` (todos) | Allowlist de IPs. Aceita IP exato ou prefixo (`'192.168.'`). Usa `REMOTE_ADDR`, nunca `X-Forwarded-For`. |
 | `REQUIRE_HTTPS` | `true` | Recusa requisição em HTTP puro no nível do PHP (localhost isento). Defesa em profundidade além do `.htaccess`. |
 | `TRUSTED_PROXIES` | `[]` (nenhum) | Proxies que terminam o TLS na frente do PHP (Cloudflare, nginx, balanceadores). Só de IPs desta lista o gateway confia em `X-Forwarded-Proto` para decidir HTTPS. Vazio = nunca confia no cabeçalho. Aceita IP exato ou prefixo, igual a `ALLOWED_IPS`. |
-| `LOG_FILE` | `router.log` | Caminho do log. String vazia desativa. |
+| `LOG_FILE` | `data/localrouter.log` | Caminho do log (renomeado de `router.log` em 0.2). String vazia desativa. |
 | `LOG_MAX_BYTES` | `5 MB` | Ao passar disso o log vira `.1` e recomeça. |
 | `CONNECT_TIMEOUT` | `10` | Segundos para abrir conexão com o provedor. |
 | `REQUEST_TIMEOUT` | `180` | Segundos por tentativa, fora de streaming. |
@@ -270,6 +291,12 @@ Para descobrir o que está no ar hoje, consulte a documentação do provedor (a 
 | `DEFAULT_MAX_TOKENS` | `4096` | Último recurso para `max_tokens`: a API Anthropic exige o campo, então este valor evita que a chamada seja recusada quando ninguém definiu nada. |
 | `ALLOW_ORIGIN` | `''` | Origem para CORS. Vazio desliga; só preencha se algum front-end chamar direto do navegador. |
 | `ANTHROPIC_VERSION` | `2023-06-01` | Valor do cabeçalho `anthropic-version`. |
+| `SKIP_EMPTY_REMOTE_KEY` | `true` | Pula provedores remotos sem chave em runtime — a chamada iria falhar 401 e gastar uma tentativa à toa. Provedores locais (Ollama, LM Studio) rodam sem chave legitimamente e seguem na fila. |
+| `FORCE_MAX_TOKENS_OPENAI` | `false` | Aplica `DEFAULT_MAX_TOKENS` a provedores OpenAI quando o cliente não enviou `max_tokens`. Alguns provedores compatíveis (vLLM, LM Studio) rejeitam requisições sem o campo; outros aceitam mas geram até o limite do contexto. |
+| `REQUEST_ID_HEADER` | `true` | Gera um `X-Request-Id` por requisição e o grava em log/métricas — correlaciona todas as tentativas (provedores, retries, fallbacks) de uma mesma chamada. Essencial para depurar "falhou em algum provedor" sem adivinhar qual. |
+| `HEALTH_PROBE_ENABLED` | `false` | Liga o probe ativo em `GET /health/providers?probe=1`: faz uma chamada leve (`HEALTH_PROBE_TOKENS`) a cada provedor marcado `'probe'=>true` em `PROVIDERS`. |
+| `HEALTH_PROBE_TOKENS` | `1` | Quantos tokens pedir no probe (mínimo possível para baratear). |
+| `HEALTH_PROBE_INTERVAL` | `300` | Segundos mínimos entre probes (respeitado via `state.json`) — não re-probe dentro da janela. |
 
 `STRATEGY = 'random'` é o padrão por um motivo: o router não guarda estado entre requisições. Com `priority`, o provedor nº 1 recebe todo o tráfego e, depois que ele estoura o limite, **toda** requisição paga uma ida e volta perdida antes de cair no nº 2. O sorteio dilui esse custo.
 
@@ -312,9 +339,12 @@ O mesmo arquivo funciona como utilitário no terminal (rode de dentro da pasta d
 ```bash
 php index.php genkey          # gera uma chave para colar em GATEWAY_KEYS
 php index.php check           # valida a configuração e aponta erros comuns
+php index.php providers       # lista os provedores configurados (sem revelar chaves)
 ```
 
 O `check` detecta chave de exemplo esquecida, referência a provedor inexistente, `type` inválido em `PROVIDERS`, `url` com a rota completa em vez da base, provedor em HTTP puro fora de localhost, entrada incompleta, `weight` inválido e fallback apontando para modelo inexistente. Sai com código `1` quando há problema — dá para usar em CI ou em script de deploy.
+
+O `providers` mostra nome, tipo, URL e se a chave está definida (`sim`/`nao`/`local`) — útil para conferir o catálogo sem expor segredos.
 
 ## Endpoints
 
@@ -325,6 +355,10 @@ A API é **exclusivamente no formato OpenAI**. (Quem migrou de versões antigas:
 | `POST` | `/chat/completions` | Entrada e saída no formato OpenAI. Aceita `stream: true`. |
 | `GET` | `/models` | Lista os modelos configurados. Exige autenticação. |
 | `GET` | `/health` | `{"status":"ok"}` quando o gateway está configurado; `503 {"status":"unconfigured"}` com a chave de fábrica. **Sem autenticação** e fora da allowlist de IPs de propósito — o monitor local (`curl http://localhost:8000/health`) nunca é barrado, e a resposta não carrega nada sensível. |
+| `GET` | `/health/providers` | Health detalhado por provedor: contagem por status HTTP, latência p50/p95, taxa de erro, última tentativa. **Autenticado**. Exige `METRICS_BACKEND != 'off'`; caso contrário devolve `503 {"status":"metrics_off"}`. |
+| `GET` | `/metrics` | Métricas agregadas por provedor, formato `json` ou `prometheus`. **Autenticado** e **opt-in** (`METRICS_EXPOSE = true`). |
+
+A spec OpenAPI 3 completa está em `openapi.yaml` — abra em qualquer editor Swagger/redoc ou gere um cliente com `openapi-generator`.
 
 As rotas casam pelo **sufixo** do caminho. Isso faz funcionar tanto `/chat/completions` (com o rewrite do `.htaccess`) quanto `/index.php/chat/completions` (sem rewrite, em servidor que não permite `.htaccess`).
 
@@ -335,6 +369,12 @@ As rotas casam pelo **sufixo** do caminho. Isso faz funcionar tanto `/chat/compl
 Todas desligadas por padrão e ativadas por constante, sem tocar no resto do código.
 
 **Cooldown de provedores** (`COOLDOWN_SECONDS`) — o gateway padrão é 100% sem estado: um provedor esgotado será tentado de novo na requisição seguinte. Com cooldown ativo, quem falhou por rate limit, crédito ou 5xx fica fora da rotação pelo tempo configurado, e a requisição seguinte vai direto a quem está saudável. Falhas de configuração (401, 403, 404) **não** geram castigo de propósito: cooldown mascararia um erro que precisa de correção, não de espera. Se todos os provedores estiverem de castigo, o castigo é ignorado — tentar é melhor que falhar parado.
+
+**Circuit breaker** (`BREAKER_FAILURES`) — além do cooldown, um provedor com N falhas **consecutivas** (qualquer tipo) fica "aberto" por `BREAKER_OPEN_SECONDS` e sai da rotação. A recuperação é por **probe**: a cada `BREAKER_PROBE_SECONDS` o router deixa passar 1 requisição de teste; se acertar, o circuito fecha e o provedor volta pleno. Falha de rede pura (timeout, DNS) conta como 0.5 — precisa de duas para somar uma falha inteira, porque erros de rede costumam ser transitórios. Diferente do cooldown (que é por evento), o breaker acumula: um provedor que falha 1x a cada minuto nunca abre, mas um que falha 5x seguidas sim. Funciona sem `COOLDOWN_SECONDS`, mas os dois se complementam.
+
+**Retry no mesmo provedor** (`RETRY_SAME_PROVIDER`) — para falha de rede pura (sem status HTTP), tenta o mesmo provedor N vezes extras antes de rotacionar. Erros de rede costumam ser transitórios e baratos de tentar de novo; rotacionar já pagaria a latência de qualquer jeito. Nunca se aplica a 429/402 (cooldown no primeiro erro) nem a stream já em andamento (o parcial é guardado e a retomada acontece no próximo provedor).
+
+**Métricas por provedor** (`METRICS_BACKEND`) — registra por tentativa: provedor, status HTTP, latência, resultado. Dois backends: `'file'` (JSON rolado em `data/metrics.json`, janela de `METRICS_WINDOW_SECONDS`) ou `'sqlite'` (histórico persistente em `data/logs.db`, exige ext-pdo_sqlite; cai em `file` em silêncio se faltar). Exposto em `GET /health/providers` (sempre que autenticado) e `GET /metrics` (opt-in via `METRICS_EXPOSE`, formato `json` ou `prometheus`). Nunca grava chaves nem conteúdo.
 
 **Rate limit do gateway** (`RATE_LIMIT_PER_MINUTE`) — janela fixa global de um minuto. Não substitui o rate limit dos provedores; protege contra um app seu em loop e limita o estrago de uma chave do gateway vazada.
 
@@ -402,11 +442,11 @@ Provedor de dialeto `openai` recebe a requisição praticamente como chegou (str
 
 ## Logs
 
-Uma linha por tentativa, separada por tabulação:
+Uma linha por tentativa, separada por tabulação, em `data/localrouter.log` (renomeado de `router.log` em 0.2):
 
 ```
 2026-07-23T14:02:11+00:00	gpt-oss-120b	groq	openai/gpt-oss-120b	429	310ms	rate limit (Rate limit reached)
-2026-07-23T14:02:11+00:00	gpt-oss-120b	cerebras	gpt-oss-120b	200	842ms	ok
+2026-07-23T14:02:11+00:00	gpt-oss-120b	cerebras	gpt-oss-120b	842ms	ok
 ```
 
 Campos: data ISO, modelo pedido, **nome do provedor** (o de `PROVIDERS`, não o host — é o que separa `openrouter1` de `openrouter2`), id do modelo no provedor, status HTTP, duração, resultado.
@@ -416,7 +456,22 @@ O log **não** grava chaves de API nem o conteúdo das mensagens. Chaves que apa
 Para ver a taxa de erro por provedor:
 
 ```bash
-cut -f3,7 router.log | sort | uniq -c | sort -rn
+cut -f3,7 data/localrouter.log | sort | uniq -c | sort -rn
+```
+
+### Métricas agregadas
+
+O log é texto; para responder "qual provedor tem mais 429 hoje?" ou "qual a latência p95 do Groq?" existem as **métricas** (`METRICS_BACKEND`), que agregam contagem por status, latência p50/p95 e taxa de erro por provedor. Dois backends:
+
+- **`file`** — `data/metrics.json`, rolado a cada `METRICS_WINDOW_SECONDS` (default 1h). Leve, sem extensões.
+- **`sqlite`** — `data/logs.db`, histórico persistente. Exige ext-pdo_sqlite (cai em `file` em silêncio se faltar).
+
+Consulte via `GET /health/providers` (sempre que métricas estiverem on) ou `GET /metrics` (opt-in via `METRICS_EXPOSE`, formato `json` ou `prometheus` para Prometheus/Grafana):
+
+```bash
+curl http://localhost:8000/metrics \
+  -H "Authorization: Bearer SUA_CHAVE" \
+  -H "Accept: text/plain"   # prometheus text format
 ```
 
 ---
@@ -435,12 +490,98 @@ O que já está implementado:
 - **Aborto por desconexão**: cliente que fecha a conexão no meio de um streaming derruba também a chamada ao provedor.
 - **`Authorization` preservado em CGI/FastCGI** pelo `.htaccess` — sem isso, metade das hospedagens compartilhadas devolveria 401 para tudo.
 - **Allowlist de IPs opcional** (`ALLOWED_IPS`) como segunda tranca.
+- **Listagem de diretório desligada** em duas trancas: `Options -Indexes` + `IndexIgnore *` no `.htaccess`, e `data/` bloqueada por rewrite além do `.htaccess` interno que o PHP cria dentro dela.
 
 O que depende de você:
 
 - **Não versione o arquivo com chaves reais.** Se o projeto for para um repositório público, troque os valores por `getenv('GROQ_KEY')` e defina as variáveis no painel da hospedagem.
-- **Confirme que `router.log` não é servido.** O `.htaccess` bloqueia `.log`, mas em Nginx a regra equivalente precisa ser escrita no `server` block.
+- **Confirme que `localrouter.log` não é servido.** O `.htaccess` bloqueia `.log`, mas em Nginx a regra equivalente precisa ser escrita no `server` block.
 - **Rotacione a chave do gateway** se ela circular por apps de terceiros.
+
+---
+
+## Troubleshooting
+
+Diagnóstico por etapas, em texto (sem fluxogramas). Siga na ordem — cada passo aponta o próximo.
+
+### 1. A configuração está válida?
+
+```bash
+php index.php check
+```
+
+Lista problemas de configuração (chaves ausentes, URLs sem protocolo, referências quebradas em `MODELS`, parâmetros fora de faixa). Sai com código `1` se houver qualquer problema, `0` se tudo estiver ok. Provedores remotos sem chave aparecem como `[!]` (erro — a chamada vai falhar); provedores locais sem chave aparecem como `[?]` (aviso — ok para Ollama/LM Studio).
+
+Para ver só os provedores configurados (sem revelar chaves):
+
+```bash
+php index.php providers
+```
+
+Mostra nome, tipo, URL e se a chave está definida (`sim`/`nao`/`local`).
+
+### 2. O gateway está no ar?
+
+```bash
+# local
+curl http://localhost:8000/health
+
+# publicado
+curl https://seudominio.com/health
+```
+
+- `200 {"status":"ok"}` — gateway configurado e respondendo.
+- `503 {"status":"unconfigured"}` — `GATEWAY_KEYS` ainda tem a chave de exemplo. Gere uma com `php index.php genkey` e troque.
+
+### 3. Os provedores estão saudáveis?
+
+```bash
+# métricas passivas (latência/erros da janela atual — requer autenticação)
+curl https://seudominio.com/health/providers -H "Authorization: Bearer SUA_CHAVE"
+
+# probe ativo (faz uma chamada leve a cada provedor marcado 'probe'=>true)
+curl "https://seudominio.com/health/providers?probe=1" -H "Authorization: Bearer SUA_CHAVE"
+```
+
+O probe ativo precisa de `HEALTH_PROBE_ENABLED=true` em `config.php` e respeita `HEALTH_PROBE_INTERVAL` (não re-probe dentro da janela). Retorna `{"skipped":true,"reason":"interval"}` se chamado cedo demais. Para um provedor entrar no probe, marque `'probe'=>true` em `PROVIDERS`:
+
+```php
+'groq' => ['url' => 'https://api.groq.com/openai/v1', 'probe' => true],
+```
+
+### 4. O que o log diz?
+
+```bash
+tail -n 50 data/localrouter.log
+```
+
+Cada linha: `data\tmodelo\tprovedor\tmodelo_do_provedor\tstatus\tduração_ms\tresultado\trequest_id`. O `request_id` (presente se `REQUEST_ID_HEADER=true`) correlaciona todas as tentativas de uma mesma chamada — útil para depurar "falhou em algum provedor" sem adivinhar qual. Filtre por um ID:
+
+```bash
+grep "req_a1b2c3d4e5f6" data/localrouter.log
+```
+
+### 5. O cliente recebeu erro, mas o log mostra 200
+
+O provedor respondeu 200 ao gateway, mas o cliente desconectou antes de receber tudo (stream interrompido). O log registra `cliente-desconectou` nesses casos. Verifique timeout no lado do cliente e estabilidade da conexão.
+
+### 6. Todos os provedores falham com 401
+
+As chaves dos provedores estão vazias ou erradas. Rode `php index.php check` — provedores remotos sem chave aparecem como `[!]`. Se `SKIP_EMPTY_REMOTE_KEY=true`, provedores remotos sem chave são pulados em runtime (não gastam tentativa); se `false`, tentam e falham 401. Confirme as variáveis de ambiente ou o `data/.env`.
+
+### 7. Provedor local (Ollama) nunca é tentado
+
+Verifique se a URL em `PROVIDERS` aponta para `http://127.0.0.1:11434/v1` (ou `http://localhost:...`). Provedores locais são detectados pelo host (`127.0.0.1`, `::1`, `localhost`, `*.localhost`) e não são pulados quando a chave está vazia. Se o Ollama não estiver rodando, a chamada falha com status `0` (conexão recusada) e o router tenta o próximo provedor.
+
+### 8. Erro intermitente, some ao recarregar
+
+Provavelmente rate limit ou circuit breaker. Veja `data/state.json`:
+
+```bash
+cat data/state.json
+```
+
+Mostra cooldowns ativos por provedor e o timestamp da última janela de rate limit. Se um provedor está em cooldown, ele volta sozinho após `COOLDOWN_SECONDS`.
 
 ---
 
@@ -448,6 +589,9 @@ O que depende de você:
 
 **`503` — "Troque a chave padrao em GATEWAY_KEYS"**
 Proteção intencional. Gere uma chave e substitua a de exemplo.
+
+**`429` com `Retry-After` — rate limit do gateway**
+`RATE_LIMIT_PER_MINUTE` foi atingido. SDKs que respeitam `Retry-After` esperam automaticamente o tempo indicado (segundos restantes na janela).
 
 **`404` — "Modelo nao configurado neste gateway"**
 O app está pedindo o id do provedor (`openai/gpt-oss-120b`) em vez da chave do array `MODELS` (`gpt-oss-120b`). Chame `GET /models` para ver os nomes válidos.
@@ -474,11 +618,33 @@ Essas linhas exigem `max_completion_tokens` no lugar de `max_tokens`. O router e
 
 ## Limitações conhecidas
 
-- **Sem estado por padrão.** Um provedor que estourou o limite será tentado de novo na próxima chamada — a menos que `COOLDOWN_SECONDS` seja ativado, que resolve exatamente isso ao custo de um arquivo de estado.
+- **Sem estado por padrão.** Um provedor que estourou o limite será tentado de novo na próxima chamada — a menos que `COOLDOWN_SECONDS` ou `BREAKER_FAILURES` seja ativado, que resolvem isso ao custo de um arquivo de estado.
 - **Retomada de stream depende de outro provedor saudável.** Se o provedor cair no meio do stream e todos os demais também falharem, o cliente recebe só o que já foi emitido (encerrado com `[DONE]`). A retomada também não é perfeita: o provedor que continua pode repetir algumas palavras do ponto de corte ou mudar levemente o tom.
-- **Sem contabilidade de custo.** O log registra tempo e status, não tokens. Para orçamento por provedor seria preciso somar o `usage` de cada resposta.
+- **Sem contabilidade de custo.** O log e as métricas registram tempo, status e latência, não tokens. Para orçamento por provedor seria preciso somar o `usage` de cada resposta.
 - **Fallback entre modelos é opcional e manual.** Só acontece se você mapear em `MODEL_FALLBACKS`.
 - **Cliente que desconecta no meio do stream** faz o gateway abortar a chamada ao provedor (para não pagar tokens à toa), mas os tokens já gerados até ali foram cobrados.
+- **Métricas em `file`** rolam a janela inteira a cada `METRICS_WINDOW_SECONDS` — não há histórico além da janela atual. Para histórico persistente, use `sqlite`.
+
+---
+
+## Docker
+
+Para rodar em container sem instalar PHP na máquina:
+
+```bash
+docker compose up -d
+curl http://localhost:8000/health
+```
+
+O `docker-compose.yml` sobe o gateway em `http://localhost:8000` com a pasta `data/` montada como volume — logs, estado, métricas e o `data/.env` persistem entre reinícios. As chaves podem ser injetadas de duas formas:
+
+1. **`data/.env`** (montado pelo volume) — edite `data/.env` no host; o container lê na hora (reinicie o container para recarregar, pois o `config.php` lê o `.env` uma vez no boot).
+
+2. **`environment:` no compose** — descomente o bloco no `docker-compose.yml` e preencha. Variável de ambiente real sempre vence o `.env`.
+
+O `Dockerfile` é minimalista: `php:8.2-cli` + `ext-curl`, sem Composer, sem build, sem servidor web — o servidor embutido do PHP basta porque o gateway é uma API stateless pensada para ficar atrás de um reverse proxy (Caddy, Traefik, nginx) em produção. O `healthcheck` do compose bate em `/health`.
+
+Para produção, coloque um reverse proxy na frente com HTTPS (Caddy com auto-TLS é o mais simples) e aponte para `localhost:8000` dentro da rede do compose.
 
 ---
 

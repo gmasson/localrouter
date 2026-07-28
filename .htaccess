@@ -1,0 +1,104 @@
+# LocalRouter — configuracao Apache da raiz do dominio
+# Testado em Apache 2.4. Blocos <IfModule> sao ignorados com seguranca quando
+# o modulo nao existe, entao o arquivo nao derruba o site em hospedagem limitada.
+
+# ---------------------------------------------------------------------------
+# 1. Sem listagem de diretorio
+#    Sem isto, um acesso a / pode expor localrouter.log e a pasta data/.
+#    Options -Indexes desliga o mod_autoindex; IndexIgnore e uma segunda
+#    tranca que esconde tudo caso o modulo esteja ausente ou AllowOverride
+#    restrinja apenas parte das diretivas.
+# ---------------------------------------------------------------------------
+Options -Indexes
+IndexIgnore *
+<IfModule mod_autoindex.c>
+    IndexOptions -FancyIndexing -HTMLTable
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # -----------------------------------------------------------------------
+    # 2. Preservar o cabecalho Authorization
+    #    Em PHP rodando como CGI/FastCGI (comum em hospedagem compartilhada)
+    #    o Apache descarta o Authorization e toda chamada vira 401. Esta
+    #    regra o repassa como variavel de ambiente antes de qualquer outra.
+    # -----------------------------------------------------------------------
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # -----------------------------------------------------------------------
+    # 3. HTTPS obrigatorio
+    #    Chaves de API trafegam neste endpoint em todo request. HTTP puro as
+    #    entrega em texto claro para qualquer intermediario da rede.
+    #    O index.php tem a mesma regra (REQUIRE_HTTPS) como defesa em
+    #    profundidade, caso o .htaccess nao seja processado.
+    # -----------------------------------------------------------------------
+    RewriteCond %{HTTPS} off
+    RewriteCond %{HTTP_HOST} !^(localhost|127\.0\.0\.1)
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # -----------------------------------------------------------------------
+    # 4. Rastreadores bloqueados por nome
+    #    A lista e nominal de proposito. Um filtro generico por "bot" no
+    #    User-Agent derrubaria integracoes legitimas que se identificam assim.
+    # -----------------------------------------------------------------------
+    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ChatGPT-User|OAI-SearchBot|CCBot|ClaudeBot|Claude-Web|anthropic-ai|Google-Extended|Googlebot|Bingbot|Applebot|Amazonbot|Bytespider|PetalBot|YandexBot|Baiduspider|DuckDuckBot|facebookexternalhit|Twitterbot|AhrefsBot|SemrushBot|MJ12bot|DotBot|DataForSeoBot|Screaming\ Frog) [NC]
+    RewriteRule ^ - [F,L]
+
+    # -----------------------------------------------------------------------
+    # 5. Metodos aceitos
+    #    O router so usa GET, POST e OPTIONS. O resto e recusado antes do PHP.
+    # -----------------------------------------------------------------------
+    RewriteCond %{REQUEST_METHOD} !^(GET|POST|OPTIONS)$
+    RewriteRule ^ - [F,L]
+
+    # -----------------------------------------------------------------------
+    # 6. Arquivos internos fora do alcance da web
+    #    src/ e config.php nunca sao servidos diretamente. Cada um deles
+    #    tambem morre sozinho se executado sem o bootstrap (guard interno),
+    #    entao esta regra e a primeira de duas trancas.
+    # -----------------------------------------------------------------------
+    RewriteRule ^src(/|$) - [F,L]
+    RewriteRule ^config\.php$ - [F,L]
+    # data/ guarda estado (cooldown/rate limit) e logs SQLite; nunca servido.
+    RewriteRule ^data(/|$) - [F,L]
+
+    # -----------------------------------------------------------------------
+    # 7. Roteamento
+    #    Qualquer caminho que nao seja um arquivo real cai no index.php, o que
+    #    permite /chat/completions e /models como URLs limpas na raiz.
+    # -----------------------------------------------------------------------
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [QSA,L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    # -----------------------------------------------------------------------
+    # 8. Cabecalhos de resposta
+    #    X-Robots-Tag e o que realmente tira a pasta dos indices: robots.txt
+    #    so e lido na raiz do dominio e nao alcanca subpastas.
+    # -----------------------------------------------------------------------
+    Header always set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+    Header always set Cache-Control "no-store"
+    Header unset X-Powered-By
+</IfModule>
+
+# ---------------------------------------------------------------------------
+# 9. Arquivos que nunca podem ser servidos
+#    localrouter.log guarda hosts dos provedores e historico de falhas; data/
+#    guarda o estado de cooldown e rate limit (protegida tambem por um
+#    .htaccess proprio que o index.php cria dentro dela) e o banco SQLite de
+#    metricas (logs.db). .db/.sqlite/.sqlite-shm/.sqlite-wal cobrem o SQLite.
+# ---------------------------------------------------------------------------
+<FilesMatch "\.(log|md|json|bak|sql|env|ini|txt|lock|db|sqlite|sqlite-shm|sqlite-wal)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

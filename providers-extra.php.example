@@ -1,0 +1,61 @@
+<?php
+/**
+ * LocalRouter — catálogo extra de provedores (NÃO é carregado pelo router)
+ *
+ * O config.php traz só os provedores usados pelos modelos que vêm de
+ * fábrica, para que "php index.php check" fale do que importa em vez de
+ * listar vinte serviços sem chave. Este arquivo guarda o resto do catálogo.
+ *
+ * Como usar: abra, copie a linha do provedor que você quer, cole dentro do
+ * return [...] do providers.php (na raiz) e adicione a chave no data/.env.
+ * Depois aponte um modelo para ele em models.php e rode:
+ *
+ *   php index.php check
+ *   php index.php test <seu-modelo>
+ *
+ * O arquivo é um array PHP válido de propósito: dá para conferir com
+ * php -l e até carregar com require se você preferir manter o catálogo
+ * separado (PROVIDERS aceita array_merge no config.php).
+ */
+
+return [
+
+    // --- Gratuitos ou com camada gratuita generosa ------------------------
+    'groq'         => ['url' => 'https://api.groq.com/openai/v1', 'key' => env('GROQ_API_KEY')],
+    'cerebras'     => ['url' => 'https://api.cerebras.ai/v1', 'key' => env('CEREBRAS_API_KEY')],
+    'orcarouter'   => ['url' => 'https://api.orcarouter.ai/v1', 'key' => env('ORCAROUTER_KEY')],
+    'mistral'      => ['url' => 'https://api.mistral.ai/v1', 'key' => env('MISTRAL_API_KEY')],
+    'huggingface'  => ['url' => 'https://router.huggingface.co/v1', 'key' => env('HF_TOKEN')],
+    'siliconflow'  => ['url' => 'https://api.siliconflow.cn/v1', 'key' => env('SILICONFLOW_KEY')],
+    'ollama_cloud' => ['url' => 'https://ollama.com/v1', 'key' => env('OLLAMA_KEY')],
+    'vercel'       => ['url' => 'https://ai-gateway.vercel.sh/v1', 'key' => env('VERCEL_AI_KEY')],
+    'google'       => ['url' => 'https://generativelanguage.googleapis.com/v1beta/openai', 'key' => env('GEMINI_API_KEY')],
+
+    // Cloudflare exige o id da conta no caminho — defina CF_ACCOUNT_ID no .env.
+    'cloudflare'   => ['url' => 'https://api.cloudflare.com/client/v4/accounts/'
+        . (env('CF_ACCOUNT_ID') !== '' ? env('CF_ACCOUNT_ID') : 'ACCOUNT_ID') . '/ai/v1', 'key' => env('CF_API_TOKEN')],
+
+    // --- Pagos ou créditos de trial ---------------------------------------
+    'openai'       => ['url' => 'https://api.openai.com/v1', 'key' => env('OPENAI_API_KEY')],
+    'xai'          => ['url' => 'https://api.x.ai/v1', 'key' => env('XAI_API_KEY')],
+    'fireworks'    => ['url' => 'https://api.fireworks.ai/inference/v1', 'key' => env('FIREWORKS_API_KEY')],
+    'nebius'       => ['url' => 'https://api.studio.nebius.com/v1', 'key' => env('NEBIUS_API_KEY')],
+    'novita'       => ['url' => 'https://api.novita.ai/v3/openai', 'key' => env('NOVITA_API_KEY')],
+    'zai'          => ['url' => 'https://open.bigmodel.cn/api/paas/v4', 'key' => env('ZAI_API_KEY')],
+
+    // --- Rodando na sua própria máquina (sem chave) -----------------------
+    'lm_studio'    => ['url' => 'http://127.0.0.1:1234/v1'],
+    'vllm'         => ['url' => 'http://127.0.0.1:8000/v1'],
+
+    // --- Exemplo com teto diário declarado --------------------------------
+    // O router conta as tentativas do dia e tira o provedor da fila ao bater o
+    // limite, em vez de descobrir isso no 429 — que já custou a requisição.
+    'groq_limitado' => ['url' => 'https://api.groq.com/openai/v1', 'key' => env('GROQ_API_KEY'), 'rpd' => 1000],
+
+    // --- Exemplo com reconexão de cold start (serverless que escala a zero) --
+    // A primeira chamada encontra o container dormindo e falha com conexão
+    // recusada, 5xx do proxy ou 404 "route not found". Com retries > 0 o
+    // router espera retry_delay segundos e reconecta no MESMO host, em vez de
+    // rotacionar para um provedor mais caro.
+    // 'modal' => ['url' => 'https://seu-workspace--seu-endpoint.modal.run/v1', 'key' => env('MODAL_KEY'), 'retries' => 2, 'retry_delay' => 15],
+];

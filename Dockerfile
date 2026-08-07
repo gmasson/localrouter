@@ -17,13 +17,12 @@ EXPOSE 8000
 
 WORKDIR /app
 
-# Copia só o necessário: config, entrypoint e src/. A pasta data/ é volume
-# (montada em runtime) — nunca bakear chaves na imagem.
-COPY config.php index.php robots.txt ./
+# Copia só o necessário: config, entrypoint, src/ e os catálogos. A pasta
+# data/ é volume (montada em runtime) — nunca bakear chaves na imagem.
+# providers.php e models.php são código (incluídos pelo config.php via
+# require), então precisam estar na imagem — copie-os explicitamente.
+COPY config.php index.php robots.txt providers.php models.php ./
 COPY src/ ./src/
-
-# data/ precisa existir para o volume montado não criar como root-owned.
-RUN mkdir -p data
 
 # -t 0.0.0.0:8000 escuta em todas as interfaces (necessário fora do host).
 # -S sobe o servidor embutido. docroot = /app faz /health, /models etc.

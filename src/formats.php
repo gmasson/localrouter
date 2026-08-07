@@ -2,19 +2,20 @@
 declare(strict_types=1);
 
 /**
- * LocalRouter — traducao de formatos
+ * LocalRouter — tradução de formatos
  *
- * Entrada (sempre OpenAI) -> forma canonica -> payload do provedor
- * (openai ou anthropic) -> resposta canonica -> saida OpenAI.
- * Blocos canonicos: text, image, image_url, document, audio, tool_use,
- * tool_result. Audio nao tem equivalente na API Anthropic e e descartado
- * ao traduzir para esse dialeto.
- * */
+ * Entrada (sempre OpenAI) -> forma canônica -> payload do provedor ->
+ * resposta canônica -> saída OpenAI.
+ *
+ * Blocos canônicos: text, thinking, image, image_url, document, audio,
+ * tool_use, tool_result. Audio não existe na API Anthropic e é descartado
+ * ali; thinking só aparece na saída, nunca volta numa próxima chamada.
+ */
 
-defined('LOCALROUTER') or exit; // sem o bootstrap este arquivo nao roda sozinho
+defined('LOCALROUTER') or exit; // sem o bootstrap este arquivo não roda sozinho
 
 // =====================================================================
-// ENTRADA -> FORMA CANONICA
+// ENTRADA -> FORMA CANÔNICA
 // =====================================================================
 
 function normalize_openai_request(array $body): array
@@ -29,6 +30,9 @@ function normalize_openai_request(array $body): array
         $role = (string) ($message['role'] ?? 'user');
 
         if ($role === 'system' || $role === 'developer') {
+            if (INPUT_BLOCK_CLIENT_SYSTEM_PROMPT) {
+                continue;
+            }
             $system[] = flatten_text($message['content'] ?? '');
             continue;
         }
@@ -42,7 +46,7 @@ function normalize_openai_request(array $body): array
             continue;
         }
 
-        $blocks  = openai_content_blocks($message['content'] ?? '');
+        $blocks = openai_content_blocks($message['content'] ?? '');
         foreach ((array) ($message['tool_calls'] ?? []) as $call) {
             $arguments = json_decode((string) ($call['function']['arguments'] ?? '{}'), true);
             $blocks[]  = [
@@ -64,7 +68,7 @@ function normalize_openai_request(array $body): array
             $tools[] = [
                 'name'        => (string) $function['name'],
                 'description' => (string) ($function['description'] ?? ''),
-                'schema'      => is_array($function['parameters'] ?? null) ? $function['parameters'] : ['type' => 'object', 'properties' => []],
+                'schema'      => schema_as_object(is_array($function['parameters'] ?? null) ? $function['parameters'] : []),
             ];
         }
     }
@@ -90,6 +94,9 @@ function normalize_openai_request(array $body): array
 function openai_content_blocks(mixed $content): array
 {
     if (is_string($content)) {
+        if (INPUT_TRIM_WHITESPACE) {
+            $content = trim($content);
+        }
         return $content === '' ? [] : [['type' => 'text', 'text' => $content]];
     }
     $blocks = [];
@@ -99,7 +106,13 @@ function openai_content_blocks(mixed $content): array
         }
         $type = (string) ($part['type'] ?? '');
         if ($type === 'text' && ($part['text'] ?? '') !== '') {
-            $blocks[] = ['type' => 'text', 'text' => (string) $part['text']];
+            $text = (string) $part['text'];
+            if (INPUT_TRIM_WHITESPACE) {
+                $text = trim($text);
+            }
+            if ($text !== '') {
+                $blocks[] = ['type' => 'text', 'text' => $text];
+            }
         } elseif ($type === 'image_url') {
             $url = (string) ($part['image_url']['url'] ?? '');
             if ($url !== '') {
@@ -115,8 +128,8 @@ function openai_content_blocks(mixed $content): array
                 ];
             }
         } elseif ($type === 'file') {
-            // Aceita file_data como data-URI base64. file_id (upload previo na
-            // OpenAI) nao viaja entre provedores e por isso e ignorado.
+            // Aceita file_data como data-URI base64. file_id (upload prévio na
+            // OpenAI) não viaja entre provedores e por isso é ignorado.
             $file = is_array($part['file'] ?? null) ? $part['file'] : [];
             if (preg_match('#^data:([\w./+-]+);base64,(.*)$#s', (string) ($file['file_data'] ?? ''), $match) === 1) {
                 $blocks[] = [
@@ -155,8 +168,39 @@ function normalize_openai_tool_choice(mixed $choice): mixed
     return null;
 }
 
+/**
+ * json_decode(assoc) não distingue {} de []: os dois viram array vazio, e na
+ * volta json_encode devolve []. Ferramenta sem argumentos ("parameters": {})
+ * chegaria ao provedor como lista, e JSON Schema exige objeto ali.
+ *
+ * Corrige só onde a especificação pede objeto: o schema em si e os mapas de
+ * nome -> sub-schema. Em "required", "enum" e "allOf" o array vazio é
+ * legítimo — virá-lo objeto trocaria um erro por outro.
+ */
+function schema_as_object(array $schema): array|stdClass
+{
+    if ($schema === []) {
+        return new stdClass();
+    }
+    foreach (['properties', 'patternProperties', 'definitions', '$defs'] as $key) {
+        $map = $schema[$key] ?? null;
+        if (!is_array($map)) {
+            continue;
+        }
+        // O cast para objeto também cobre o caso de uma propriedade chamada
+        // "0": a chave numérica faria o array virar lista no json_encode.
+        $schema[$key] = $map === []
+            ? new stdClass()
+            : (object) array_map(
+                static fn (mixed $sub): mixed => is_array($sub) ? schema_as_object($sub) : $sub,
+                $map
+            );
+    }
+    return $schema;
+}
+
 // =====================================================================
-// FORMA CANONICA -> PAYLOAD DO PROVEDOR
+// FORMA CANÔNICA -> PAYLOAD DO PROVEDOR
 // =====================================================================
 
 function build_payload(array $request, array $provider): array
@@ -169,6 +213,7 @@ function build_payload(array $request, array $provider): array
 function build_openai_payload(array $request, string $model): array
 {
     $messages = [];
+
     if ($request['system'] !== '') {
         $messages[] = ['role' => 'system', 'content' => $request['system']];
     }
@@ -181,6 +226,10 @@ function build_openai_payload(array $request, string $model): array
             switch ($block['type']) {
                 case 'text':
                     $parts[] = ['type' => 'text', 'text' => $block['text']];
+                    break;
+                case 'thinking':
+                    // Raciocínio é saída, não entrada: reenviá-lo confundiria
+                    // o modelo e nenhum provedor aceita o bloco de volta.
                     break;
                 case 'image':
                     $parts[] = ['type' => 'image_url', 'image_url' => ['url' => 'data:' . $block['media_type'] . ';base64,' . $block['data']]];
@@ -206,43 +255,39 @@ function build_openai_payload(array $request, string $model): array
                     ];
                     break;
                 case 'tool_result':
-                    // No dialeto OpenAI o resultado da ferramenta e uma mensagem propria.
+                    // No dialeto OpenAI o resultado da ferramenta é uma mensagem própria.
                     $messages[] = ['role' => 'tool', 'tool_call_id' => $block['tool_use_id'], 'content' => $block['text']];
                     break;
             }
         }
 
-        if ($parts !== [] || $toolCalls !== []) {
-            $entry = ['role' => $message['role']];
-            // Texto puro vai como string: alguns provedores nao aceitam array.
-            if (count($parts) === 1 && $parts[0]['type'] === 'text') {
-                $entry['content'] = $parts[0]['text'];
-            } elseif ($parts !== []) {
-                $entry['content'] = $parts;
-            } else {
-                $entry['content'] = null;
-            }
-            if ($toolCalls !== []) {
-                $entry['tool_calls'] = $toolCalls;
-            }
-            $messages[] = $entry;
+        if ($parts === [] && $toolCalls === []) {
+            continue;
         }
+        $entry = ['role' => $message['role']];
+        // Texto puro vai como string: alguns provedores não aceitam array.
+        if (count($parts) === 1 && $parts[0]['type'] === 'text') {
+            $entry['content'] = $parts[0]['text'];
+        } else {
+            $entry['content'] = $parts !== [] ? $parts : null;
+        }
+        if ($toolCalls !== []) {
+            $entry['tool_calls'] = $toolCalls;
+        }
+        $messages[] = $entry;
     }
 
     $payload = ['model' => $model, 'messages' => $messages];
     $params  = $request['params'];
 
     // Alguns provedores OpenAI-compatíveis (ex.: vLLM, LM Studio) rejeitam
-    // requisicoes sem max_tokens; outros aceitam mas geram ate o limite
-    // do contexto. FORCE_MAX_TOKENS_OPENAI garante um default explicito
-    // (DEFAULT_MAX_TOKENS) quando o cliente nao enviou o campo — evita
-    // 400 do provedor e custo imprevisto. So se aplica a provedores openai;
-    // Anthropic ja exige max_tokens obrigatorio e e tratado em build_anthropic_payload.
-    $maxTokens = $params['max_tokens'];
-    if ($maxTokens === null && FORCE_MAX_TOKENS_OPENAI) {
-        $maxTokens = DEFAULT_MAX_TOKENS;
-    }
-    if ($maxTokens !== null) { $payload['max_tokens'] = $maxTokens; }
+    // requisições sem max_tokens; outros aceitam mas geram até o limite
+    // do contexto. FORCE_MAX_TOKENS_OPENAI garante um default explícito
+    // quando o cliente não enviou o campo — evita 400 do provedor e custo
+    // imprevisto. Anthropic já exige o campo e é tratado no outro builder.
+    $maxTokens = $params['max_tokens'] ?? (FORCE_MAX_TOKENS_OPENAI ? DEFAULT_MAX_TOKENS : null);
+
+    if ($maxTokens !== null)             { $payload['max_tokens']  = $maxTokens; }
     if ($params['temperature'] !== null) { $payload['temperature'] = $params['temperature']; }
     if ($params['top_p'] !== null)       { $payload['top_p']       = $params['top_p']; }
     if ($params['stop'] !== [])          { $payload['stop']        = $params['stop']; }
@@ -276,10 +321,9 @@ function build_openai_payload(array $request, string $model): array
 
     // Cliente e provedor falam OpenAI: repassa os extras que o cliente enviou
     // (seed, response_format, reasoning_effort...). O + preserva o que o
-    // router ja definiu. Provedores Anthropic nao recebem extras: nao ha
+    // router já definiu. Provedores Anthropic não recebem extras: não há
     // equivalente, e inventar um seria mentir sobre o que foi pedido.
-    $payload += $request['extra'];
-    return $payload;
+    return $payload + $request['extra'];
 }
 
 function build_anthropic_payload(array $request, string $model): array
@@ -292,6 +336,8 @@ function build_anthropic_payload(array $request, string $model): array
                 case 'text':
                     $blocks[] = ['type' => 'text', 'text' => $block['text']];
                     break;
+                case 'thinking':
+                    break; // ver comentário no builder openai
                 case 'image':
                     $blocks[] = ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => $block['media_type'], 'data' => $block['data']]];
                     break;
@@ -306,7 +352,7 @@ function build_anthropic_payload(array $request, string $model): array
                     $blocks[] = $document;
                     break;
                 case 'audio':
-                    // A API Anthropic nao aceita audio de entrada: o bloco e
+                    // A API Anthropic não aceita audio de entrada: o bloco é
                     // descartado aqui e o resto da mensagem segue normalmente.
                     break;
                 case 'tool_use':
@@ -317,27 +363,23 @@ function build_anthropic_payload(array $request, string $model): array
                     break;
             }
         }
-        if ($blocks !== []) {
-            $messages[] = ['role' => $message['role'], 'content' => $blocks];
-        }
-    }
-
-    // A API Anthropic exige alternancia de papeis: funde mensagens vizinhas iguais.
-    $merged = [];
-    foreach ($messages as $message) {
-        $last = count($merged) - 1;
-        if ($last >= 0 && $merged[$last]['role'] === $message['role']) {
-            $merged[$last]['content'] = array_merge($merged[$last]['content'], $message['content']);
+        if ($blocks === []) {
             continue;
         }
-        $merged[] = $message;
+        // A API Anthropic exige alternância de papéis: funde mensagens vizinhas iguais.
+        $last = count($messages) - 1;
+        if ($last >= 0 && $messages[$last]['role'] === $message['role']) {
+            $messages[$last]['content'] = array_merge($messages[$last]['content'], $blocks);
+            continue;
+        }
+        $messages[] = ['role' => $message['role'], 'content' => $blocks];
     }
 
     $params  = $request['params'];
     $payload = [
         'model'      => $model,
-        'messages'   => $merged,
-        'max_tokens' => $params['max_tokens'] ?? DEFAULT_MAX_TOKENS, // obrigatorio nesta API
+        'messages'   => $messages,
+        'max_tokens' => $params['max_tokens'] ?? DEFAULT_MAX_TOKENS, // obrigatório nesta API
     ];
 
     if ($request['system'] !== '')       { $payload['system']         = $request['system']; }
@@ -376,6 +418,12 @@ function canonical_from_openai_response(array $response): array
     $message = $response['choices'][0]['message'] ?? [];
     $blocks  = [];
 
+    // Raciocínio visível: reasoning_content (DeepSeek, OpenRouter) ou
+    // reasoning (alguns gateways). Vem antes do texto porque foi produzido antes.
+    $reasoning = flatten_text($message['reasoning_content'] ?? $message['reasoning'] ?? '');
+    if ($reasoning !== '') {
+        $blocks[] = ['type' => 'thinking', 'text' => $reasoning];
+    }
     if (($message['content'] ?? null) !== null && $message['content'] !== '') {
         $blocks[] = ['type' => 'text', 'text' => flatten_text($message['content'])];
     }
@@ -406,6 +454,8 @@ function canonical_from_anthropic_response(array $response): array
     foreach ((array) ($response['content'] ?? []) as $block) {
         if (($block['type'] ?? '') === 'text') {
             $blocks[] = ['type' => 'text', 'text' => (string) ($block['text'] ?? '')];
+        } elseif (($block['type'] ?? '') === 'thinking') {
+            $blocks[] = ['type' => 'thinking', 'text' => (string) ($block['thinking'] ?? '')];
         } elseif (($block['type'] ?? '') === 'tool_use') {
             $blocks[] = [
                 'type'  => 'tool_use',
@@ -427,13 +477,34 @@ function canonical_from_anthropic_response(array $response): array
     ];
 }
 
+/**
+ * HTTP 200 não garante resposta. Provedores gratuitos devolvem 200 com
+ * {"error": ...}, com "choices": [] ou com content vazio quando a quota
+ * acaba — entregar isso ao cliente seria transformar uma falha do provedor
+ * numa resposta em branco. Aqui o gateway prefere rotacionar.
+ */
+function canonical_is_usable(array $canonical): bool
+{
+    foreach ($canonical['content'] as $block) {
+        // Bloco 'thinking' sozinho não conta: o modelo raciocinou e não
+        // respondeu, e o cliente ficaria com content vazio.
+        if ($block['type'] === 'tool_use' || ($block['type'] === 'text' && trim($block['text']) !== '')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function render_openai_response(array $canonical, string $model): array
 {
     $text      = '';
+    $reasoning = '';
     $toolCalls = [];
     foreach ($canonical['content'] as $block) {
         if ($block['type'] === 'text') {
             $text .= $block['text'];
+        } elseif ($block['type'] === 'thinking') {
+            $reasoning .= $block['text'];
         } else {
             $toolCalls[] = [
                 'id'       => $block['id'] ?: new_id('call'),
@@ -444,6 +515,12 @@ function render_openai_response(array $canonical, string $model): array
     }
 
     $message = ['role' => 'assistant', 'content' => $text === '' ? null : $text];
+    // Campo fora do padrão OpenAI original, mas já é convenção entre os
+    // provedores de modelos de raciocínio — e clientes que não o conhecem
+    // simplesmente o ignoram.
+    if ($reasoning !== '') {
+        $message['reasoning_content'] = $reasoning;
+    }
     if ($toolCalls !== []) {
         $message['tool_calls'] = $toolCalls;
     }
@@ -469,10 +546,10 @@ function render_openai_response(array $canonical, string $model): array
 function canonical_stop(string $reason): string
 {
     return match ($reason) {
-        'length', 'max_tokens'      => 'max_tokens',
-        'tool_calls', 'tool_use'    => 'tool_use',
-        'stop_sequence'             => 'stop_sequence',
-        default                     => 'end_turn',
+        'length', 'max_tokens'   => 'max_tokens',
+        'tool_calls', 'tool_use' => 'tool_use',
+        'stop_sequence'          => 'stop_sequence',
+        default                  => 'end_turn',
     };
 }
 
@@ -486,17 +563,17 @@ function openai_stop(string $canonical): string
 }
 
 // =====================================================================
-// UTILITARIOS DE CONTEUDO
+// UTILITÁRIOS DE CONTEÚDO
 // =====================================================================
 
-/** Reduz conteudo (string ou blocos) a texto puro. */
+/** Reduz conteúdo (string ou blocos) a texto puro. */
 function flatten_text(mixed $content): string
 {
     if (is_string($content)) {
         return $content;
     }
     if (!is_array($content)) {
-        return '';
+        return is_scalar($content) ? (string) $content : '';
     }
     $parts = [];
     foreach ($content as $item) {
@@ -517,7 +594,10 @@ function stop_list(mixed $stop): array
     if (!is_array($stop)) {
         return [];
     }
-    return array_values(array_filter(array_map('strval', $stop), static fn (string $s): bool => $s !== ''));
+    return array_values(array_filter(
+        array_map('strval', array_filter($stop, 'is_scalar')),
+        static fn (string $s): bool => $s !== ''
+    ));
 }
 
 /** Copia de $source apenas as chaves listadas em $allowed que existirem. */
@@ -540,4 +620,59 @@ function int_or_null(mixed $value): ?int
 function num_or_null(mixed $value): int|float|null
 {
     return is_numeric($value) ? $value + 0 : null;
+}
+
+// =====================================================================
+// EMBEDDINGS
+// =====================================================================
+
+/**
+ * POST /embeddings tem um corpo simples e igual em todo provedor de dialeto
+ * openai, então não há forma canônica: normalizamos a entrada, trocamos o id
+ * do modelo pelo do provedor e repassamos. A API Anthropic não tem endpoint
+ * equivalente — provedores desse dialeto são recusados no check.
+ */
+function build_embedding_payload(array $body, string $model): array
+{
+    $payload = ['model' => $model, 'input' => $body['input']];
+
+    if (isset($body['encoding_format']) && in_array($body['encoding_format'], ['float', 'base64'], true)) {
+        $payload['encoding_format'] = $body['encoding_format'];
+    }
+    if (($dimensions = int_or_null($body['dimensions'] ?? null)) !== null && $dimensions > 0) {
+        $payload['dimensions'] = $dimensions;
+    }
+    if (isset($body['user']) && is_string($body['user'])) {
+        $payload['user'] = $body['user'];
+    }
+    return $payload;
+}
+
+/** O corpo do cliente traz um input aproveitável? String, ou lista de strings/tokens. */
+function embedding_input_is_valid(mixed $input): bool
+{
+    if (is_string($input)) {
+        return trim($input) !== '';
+    }
+    if (!is_array($input) || $input === []) {
+        return false;
+    }
+    foreach ($input as $item) {
+        if (!is_string($item) && !is_int($item) && !is_array($item)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * A resposta do provedor tem ao menos um vetor? Mesmo motivo da versão de
+ * chat: free tier devolve 200 com corpo vazio quando a cota acaba.
+ */
+function embedding_response_is_usable(mixed $decoded): bool
+{
+    return is_array($decoded)
+        && is_array($decoded['data'] ?? null)
+        && $decoded['data'] !== []
+        && !empty($decoded['data'][0]['embedding']);
 }

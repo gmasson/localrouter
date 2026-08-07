@@ -22,13 +22,13 @@ services:
     # Exemplo de variáveis de ambiente (descomente e preencha, ou use
     # data/.env montado pelo volume acima). Variável real vence o .env.
     # environment:
-    #   GROQ_API_KEY: gsk_...
     #   OPENROUTER_KEY: sk-or-...
-    #   ANTHROPIC_API_KEY: sk-ant-...
+    #   GOOGLE_KEY: ...
     #   LR_GATEWAY_KEY: sk-lr-...
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "php", "-r", "echo @file_get_contents('http://localhost:8000/health') ? 0 : 1;"]
+      # exit code real: echo imprimiria 0/1 mas sairia sempre 0 (healthy).
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://localhost:8000/health') === false ? 1 : 0);"]
       interval: 30s
       timeout: 5s
       retries: 3

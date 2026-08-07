@@ -2,36 +2,27 @@
 declare(strict_types=1);
 
 /**
- * LocalRouter
- * Projeto open-source sob licenca MIT.
+ * LocalRouter — gateway de IA com API no formato OpenAI e rotação
+ * automática de provedores. Projeto open-source sob licença MIT.
  *
- * Gateway de IA com API no formato OpenAI e rotacao automatica de
- * provedores (dialetos openai e anthropic) para nunca parar de responder.
- *
- * Endpoints:
- *   POST /chat/completions  -> conclui usando o primeiro provedor saudavel
- *   GET  /models            -> lista os modelos configurados
- *   GET  /health            -> monitoramento; sem autenticacao
- *
- * Terminal:
- *   php index.php genkey       -> gera uma chave para GATEWAY_KEYS
- *   php index.php check        -> valida a configuracao
- *
- * A configuracao inteira fica em config.php. Este arquivo so carrega as
- * partes na ordem certa e despacha para a web ou para a linha de comando.
+ * Este arquivo só carrega as partes na ordem certa e despacha para a web
+ * ou para o terminal. Toda a configuração fica em config.php.
  */
 
-define('LOCALROUTER', '0.2');
+define('LOCALROUTER', '0.3');
 
-require __DIR__ . '/config.php';
+// LR_CONFIG aponta para outro config.php (permite apontar o gateway para
+// uma configuração alternativa sem editar este arquivo).
+// Sem a variável, vale o config.php ao lado deste arquivo.
+require (getenv('LR_CONFIG') ?: __DIR__ . '/config.php');
 require __DIR__ . '/src/providers.php';
 require __DIR__ . '/src/formats.php';
 require __DIR__ . '/src/streaming.php';
 require __DIR__ . '/src/metrics.php';
 require __DIR__ . '/src/gateway.php';
 
-// Terminal: utilitarios de configuracao, sem tocar na parte web.
-// cli.php so e carregado em runtime CLI — o bootstrap web nunca o inclui.
+// Terminal: utilitários de configuração, sem tocar na parte web.
+// cli.php só é carregado em runtime CLI — o bootstrap web nunca o inclui.
 if (PHP_SAPI === 'cli') {
     require __DIR__ . '/src/cli.php';
     cli_entry($GLOBALS['argv'] ?? []);
@@ -43,16 +34,16 @@ if (PHP_SAPI === 'cli') {
 // ---------------------------------------------------------------------
 
 ini_set('display_errors', '0');          // erro nunca vaza caminho de arquivo para o cliente
-ini_set('zlib.output_compression', '0'); // compressao quebraria o streaming
+ini_set('zlib.output_compression', '0'); // compressão quebraria o streaming
 error_reporting(E_ALL);
 while (ob_get_level() > 0) {
     ob_end_clean();
 }
 
-// Mantem o script rodando apos o cliente fechar a conexao para o curl ser
-// abortado de forma limpa (connection_aborted() so e confiavel com flush
+// Mantém o script rodando após o cliente fechar a conexão para o curl ser
+// abortado de forma limpa (connection_aborted() só é confiável com flush
 // ativo; sem isto, em alguns SAPIs a chamada ao provedor fica pendurada
-// ate o timeout). O deteccao de desconexao encerra a chamada ao provedor.
+// até o timeout). A detecção de desconexão encerra a chamada ao provedor.
 ignore_user_abort(true);
 
 // Falha inesperada nunca vira stack trace na resposta.

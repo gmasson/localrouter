@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: LocalRouter
-  version: "0.2"
+  version: "0.3"
   description: |
     Gateway de IA com API no formato OpenAI e rotação automática de provedores
     (dialetos OpenAI e Anthropic). Quando um provedor devolve erro, estoura o
@@ -192,8 +192,49 @@ components:
             completion_tokens: { type: integer }
             total_tokens: { type: integer }
 
-security:
-  - bearer: []
+    EmbeddingRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          description: Nome do modelo em MODELS com `type: embedding` (o do gateway, não o do provedor).
+          example: embed-small
+        input:
+          description: Texto único ou lista de textos.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+        encoding_format:
+          type: string
+          enum: [float, base64]
+        dimensions:
+          type: integer
+          minimum: 1
+        user:
+          type: string
+
+    EmbeddingResponse:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        model:  { type: string, description: Nome do modelo no gateway. }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              object:    { type: string, example: embedding }
+              index:     { type: integer }
+              embedding:
+                type: array
+                items: { type: number }
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            total_tokens:  { type: integer }
 
 paths:
   /chat/completions:
@@ -211,6 +252,22 @@ paths:
       responses:
         '200':
           description: Completion (não-streaming) ou início do stream SSE.
+          headers:
+            X-Request-Id:
+              schema: { type: string }
+              description: ID que correlaciona todas as tentativas (provedores, retries, fallbacks) desta chamada.
+            X-Router-Fallback:
+              schema: { type: string }
+              description: Presente apenas quando MODEL_FALLBACKS trocou o modelo pedido por outro. Traz o modelo que realmente respondeu.
+            X-Router-Provider:
+              schema: { type: string }
+              description: Nome do provedor que atendeu (o de PROVIDERS). Presente apenas se EXPOSE_PROVIDER_HEADER=true.
+            X-Router-Model:
+              schema: { type: string }
+              description: Id do modelo no provedor que atendeu. Presente apenas se EXPOSE_PROVIDER_HEADER=true.
+            X-Router-Attempt:
+              schema: { type: integer }
+              description: Número da tentativa bem-sucedida (1 = primeiro provedor). Presente apenas se EXPOSE_PROVIDER_HEADER=true.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CompletionResponse' }
@@ -226,7 +283,43 @@ paths:
             Retry-After:
               schema: { type: string }
               description: Segundos restantes na janela.
-        '502': { description: Todos os provedores falharam. }
+        '502':
+          description: |
+            Todos os provedores falharam. A resposta traz X-Router-Attempts
+            com quantos foram tentados. Se o último erro foi 400, o status
+            devolvido é 400 com type invalid_request_error: a causa está no
+            corpo enviado, não nos provedores.
+
+  /embeddings:
+    post:
+      summary: Gera vetores de embedding (formato OpenAI)
+      description: |
+        Mesma rotação de provedores do chat, com os modelos de `type: embedding`
+        em `MODELS` (em `models.php`). Só provedores de dialeto `openai`:
+        a API Anthropic não tem endpoint equivalente. Uma resposta 200 sem
+        nenhum vetor conta como falha do provedor e o router passa para o próximo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmbeddingRequest' }
+      responses:
+        '200':
+          description: Lista de vetores. O campo `model` traz o nome do gateway, não o do provedor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmbeddingResponse' }
+        '400': { description: Campo input ausente ou vazio. }
+        '401': { description: Chave do gateway inválida ou ausente. }
+        '404': { description: Modelo não configurado (ou não é `type: embedding`), ou nenhum modelo de embedding configurado. }
+        '405': { description: Método diferente de POST. }
+        '429': { description: Rate limit do gateway (por chave). Traz Retry-After. }
+        '502':
+          description: |
+            Todos os provedores falharam. A resposta traz X-Router-Attempts
+            com quantos foram tentados. Se o último erro foi 400, o status
+            devolvido é 400 com type invalid_request_error: a causa está no
+            corpo enviado, não nos provedores.
 
   /models:
     get:
@@ -271,21 +364,18 @@ paths:
       summary: Métricas agregadas (autenticado, opt-in)
       description: |
         Contadores agregados por provedor. Formato `json` (default) ou
-        `prometheus` (text format, compatível com Prometheus/Grafana).
+        `prometheus` (text format, compatível com Prometheus/Grafana),
+        conforme `METRICS_FORMAT` do config.
         Desligado por padrão — ative com `METRICS_EXPOSE = true`.
-      parameters:
-        - in: header
-          name: Accept
-          schema: { type: string }
-          description: |
-            `application/json` (default) ou `text/plain` para Prometheus.
-            O formato também segue `METRICS_FORMAT` do config.
       responses:
         '200':
-          description: Métricas no formato pedido.
+          description: Métricas no formato configurado.
           content:
             application/json:
               schema: { type: object }
             text/plain:
               schema: { type: string }
         '404': { description: METRICS_EXPOSE desligado. }
+
+security:
+  - bearer: []

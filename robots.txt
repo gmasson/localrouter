@@ -1,5 +1,5 @@
-# O LocalRouter nao tem conteudo para rastreadores. O .htaccess bloqueia
-# a pasta via X-Robots-Tag; este robots.txt e a camada extra que os
-# rastreadores respeitam na raiz do dominio.
+# O LocalRouter não tem conteúdo para rastreadores. O .htaccess bloqueia
+# a pasta via X-Robots-Tag; este robots.txt é a camada extra que os
+# rastreadores respeitam na raiz do domínio.
 User-agent: *
 Disallow: /

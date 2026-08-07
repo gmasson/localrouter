@@ -2,14 +2,14 @@
 declare(strict_types=1);
 
 /**
- * LocalRouter — nucleo do gateway
+ * LocalRouter — núcleo do gateway
  *
- * Fluxo de uma requisicao: guards -> autenticacao -> normalizacao ->
- * fila de provedores -> resposta. Tambem: estado opcional (cooldown e
- * rate limit), log, saida JSON/erro e a linha de comando.
+ * Fluxo de uma requisição: guards -> autenticação -> normalização ->
+ * fila de provedores -> resposta. Também: estado opcional (cooldown,
+ * circuit breaker e rate limit), log e saída JSON/erro.
  * */
 
-defined('LOCALROUTER') or exit; // sem o bootstrap este arquivo nao roda sozinho
+defined('LOCALROUTER') or exit; // sem o bootstrap este arquivo não roda sozinho
 
 // =====================================================================
 // ENTRADA E GUARDS
@@ -23,7 +23,7 @@ function main(): void
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
     // Health fica antes dos guards para o monitor local nunca ser barrado.
-    // Sem autenticacao de proposito: a resposta nao carrega nada sensivel.
+    // Sem autenticação de propósito: a resposta não carrega nada sensível.
     if ($method === 'GET' && str_ends_with($path, '/health')) {
         $ready = !gateway_has_placeholder_key();
         send_json($ready ? 200 : 503, ['status' => $ready ? 'ok' : 'unconfigured']);
@@ -31,29 +31,39 @@ function main(): void
     }
 
     guard_access();
-    guard_configuration();
 
-    // Health detalhado por provedor: requer autenticacao (expoe latencia e
-    // taxa de erro, que sao dados operacionais, nao secretos, mas nao sao
-    // publicos). Retorna 503 com corpo vazio se metricas estiverem off.
-    // Com ?probe=1 dispara o probe ativo (ver health_probe abaixo).
-    if ($method === 'GET' && str_ends_with($path, '/health/providers')) {
-        authenticate();
-        if (isset($_GET['probe']) && HEALTH_PROBE_ENABLED) {
-            $probed = health_probe();
-            send_json(200, ['status' => 'ok', 'probe' => $probed]);
+    if (ALLOW_ORIGIN !== '') {
+        header('Access-Control-Allow-Origin: ' . ALLOW_ORIGIN);
+        header('Vary: Origin');
+        header('Access-Control-Allow-Headers: authorization, x-api-key, content-type, anthropic-version');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Max-Age: 600');
+        // Sem expose, o navegador esconde os X-Router-* do JS que chamou —
+        // e são justamente eles que dizem qual provedor atendeu.
+        header('Access-Control-Expose-Headers: X-Router-Provider, X-Router-Model, X-Router-Attempt, X-Request-Id');
+        if ($method === 'OPTIONS') {
+            http_response_code(204);
             return;
         }
-        $snapshot = metrics_snapshot();
-        if ($snapshot === []) {
-            send_json(503, ['status' => 'metrics_off', 'providers' => []]);
-        } else {
-            send_json(200, ['status' => 'ok', 'providers' => $snapshot]);
-        }
+    }
+
+    guard_configuration();
+
+    // Health detalhado por provedor: requer autenticação (expõe latência e
+    // taxa de erro, que são dados operacionais, não secretos, mas não são
+    // públicos). Junta as métricas da janela com o consumo diário de quem
+    // declarou 'rpd' — que é o número que decide se o provedor ainda está
+    // na fila hoje.
+    if ($method === 'GET' && str_ends_with($path, '/health/providers')) {
+        authenticate();
+        $snapshot = quota_annotate(metrics_snapshot());
+        $snapshot === []
+            ? send_json(503, ['status' => 'metrics_off', 'providers' => []])
+            : send_json(200, ['status' => 'ok', 'providers' => $snapshot]);
         return;
     }
 
-    // Metricas agregadas: contagem por status, p50/p95, taxa de erro.
+    // Métricas agregadas: contagem por status, p50/p95, taxa de erro.
     // Autenticado como /chat/completions. Formato json ou prometheus.
     if ($method === 'GET' && str_ends_with($path, '/metrics')) {
         if (!METRICS_EXPOSE) {
@@ -61,39 +71,39 @@ function main(): void
             return;
         }
         authenticate();
-        $snapshot = metrics_snapshot();
-        $body = metrics_render($snapshot, METRICS_FORMAT);
         http_response_code(200);
         header('Content-Type: ' . (METRICS_FORMAT === 'prometheus'
             ? 'text/plain; version=0.0.4; charset=utf-8'
             : 'application/json; charset=utf-8'));
-        echo $body;
+        echo metrics_render(metrics_snapshot(), METRICS_FORMAT);
         return;
-    }
-
-    if (ALLOW_ORIGIN !== '') {
-        header('Access-Control-Allow-Origin: ' . ALLOW_ORIGIN);
-        header('Access-Control-Allow-Headers: authorization, x-api-key, content-type, anthropic-version');
-        if ($method === 'OPTIONS') {
-            http_response_code(204);
-            return;
-        }
     }
 
     // Casa pelo sufixo: funciona em /chat/completions (com rewrite),
     // em /index.php/chat/completions (sem rewrite) e em qualquer subpasta.
-    // A API exposta e exclusivamente no formato OpenAI; a traducao para
+    // A API exposta é exclusivamente no formato OpenAI; a tradução para
     // provedores Anthropic acontece por dentro.
     if (str_ends_with($path, '/chat/completions')) {
         if ($method !== 'POST') {
             send_error(405, 'invalid_request_error', 'Use POST neste endpoint.');
             return;
         }
-        authenticate();
-        handle_completion(read_json_body());
+        $bucket = authenticate();
+        deadline_start();
+        handle_completion(read_json_body(), $bucket);
         return;
     }
-    if (str_ends_with($path, '/models')) {
+    if (str_ends_with($path, '/embeddings')) {
+        if ($method !== 'POST') {
+            send_error(405, 'invalid_request_error', 'Use POST neste endpoint.');
+            return;
+        }
+        $bucket = authenticate();
+        deadline_start();
+        handle_embedding(read_json_body(), $bucket);
+        return;
+    }
+    if ($method === 'GET' && str_ends_with($path, '/models')) {
         authenticate();
         send_json(200, ['object' => 'list', 'data' => list_models()]);
         return;
@@ -101,20 +111,23 @@ function main(): void
     send_error(404, 'not_found', 'Rota desconhecida. A API e no formato OpenAI: use /chat/completions ou /models.');
 }
 
-/** Fecha o gateway para quem nao apresenta uma chave valida. */
-function authenticate(): void
+/**
+ * Fecha o gateway para quem não apresenta uma chave válida e devolve o
+ * identificador do balde de rate limit daquela chave — um hash curto, para
+ * o state.json nunca guardar a chave em si.
+ */
+function authenticate(): string
 {
-    $sent = '';
     $auth = server_header('HTTP_AUTHORIZATION') ?: server_header('REDIRECT_HTTP_AUTHORIZATION');
-    if ($auth !== '' && stripos($auth, 'bearer ') === 0) {
-        $sent = trim(substr($auth, 7));
-    } elseif (server_header('HTTP_X_API_KEY') !== '') {
-        $sent = trim(server_header('HTTP_X_API_KEY'));
-    }
+    $sent = $auth !== '' && stripos($auth, 'bearer ') === 0
+        ? trim(substr($auth, 7))
+        : trim(server_header('HTTP_X_API_KEY'));
 
-    foreach (GATEWAY_KEYS as $valid) {
-        if ($sent !== '' && hash_equals((string) $valid, $sent)) {
-            return;
+    if ($sent !== '') {
+        foreach (GATEWAY_KEYS as $valid) {
+            if (hash_equals((string) $valid, $sent)) {
+                return substr(md5($sent), 0, 8);
+            }
         }
     }
     send_error(401, 'authentication_error', 'Chave de API invalida ou ausente.');
@@ -123,8 +136,15 @@ function authenticate(): void
 
 function read_json_body(): array
 {
-    // Rejeita cedo pelo tamanho declarado e nunca le alem do teto:
-    // um corpo gigante nao pode consumir memoria antes do 413.
+    if (INPUT_VALIDATE_CONTENT_TYPE && INPUT_ALLOWED_CONTENT_TYPES !== []) {
+        $contentType = strtolower(trim(explode(';', (string) ($_SERVER['CONTENT_TYPE'] ?? ''))[0]));
+        if (!in_array($contentType, INPUT_ALLOWED_CONTENT_TYPES, true)) {
+            send_error(415, 'invalid_request_error', 'Content-Type nao aceito.');
+            exit;
+        }
+    }
+    // Rejeita cedo pelo tamanho declarado e nunca lê além do teto:
+    // um corpo gigante não pode consumir memória antes do 413.
     $declared = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
     if ($declared > MAX_BODY_BYTES) {
         send_error(413, 'invalid_request_error', 'Corpo da requisicao acima do limite.');
@@ -139,7 +159,9 @@ function read_json_body(): array
         send_error(413, 'invalid_request_error', 'Corpo da requisicao acima do limite.');
         exit;
     }
-    $body = json_decode($raw, true);
+    // Profundidade limitada: aninhamento absurdo é barato de enviar e caro
+    // de percorrer. 64 níveis cobrem qualquer JSON Schema realista.
+    $body = json_decode($raw, true, 64);
     if (!is_array($body)) {
         send_error(400, 'invalid_request_error', 'JSON invalido.');
         exit;
@@ -149,9 +171,13 @@ function read_json_body(): array
 
 function list_models(): array
 {
-    $out = [];
-    foreach (array_keys(MODELS) as $name) {
-        $out[] = ['id' => $name, 'object' => 'model', 'created' => 0, 'owned_by' => 'ai-router'];
+    $created = time();
+    $out     = [];
+    // 'owned_by' é o único campo livre do formato OpenAI: usamos para dizer
+    // qual o type do modelo (em qual endpoint ele atende), sem inventar campo.
+    // MODELS é a única tabela; o type de cada entrada decide o agrupamento.
+    foreach (MODELS as $name => $config) {
+        $out[] = ['id' => $name, 'object' => 'model', 'created' => $created, 'owned_by' => 'localrouter/' . model_type($config)];
     }
     return $out;
 }
@@ -163,8 +189,8 @@ function guard_access(): void
         send_error(403, 'permission_error', 'Origem nao autorizada.');
         exit;
     }
-    // Recusa em vez de redirecionar: se a chave ja chegou por HTTP, ela ja
-    // trafegou exposta — um redirect so faria o cliente reenvia-la.
+    // Recusa em vez de redirecionar: se a chave já chegou por HTTP, ela já
+    // trafegou exposta — um redirect só faria o cliente reenviá-la.
     if (REQUIRE_HTTPS && !request_is_https() && !request_is_local()) {
         send_error(403, 'permission_error', 'Use HTTPS: chaves de API nao trafegam em HTTP puro.');
         exit;
@@ -194,10 +220,10 @@ function request_is_https(): bool
     if (($_SERVER['SERVER_PORT'] ?? '') === '443') {
         return true;
     }
-    // Atras de proxy TLS (Cloudflare etc.) o PHP so ve HTTP; o proxy avisa
-    // via X-Forwarded-Proto. Mas qualquer cliente pode forjar esse cabecalho,
-    // entao so confiamos nele quando a requisicao veio de um proxy listado
-    // em TRUSTED_PROXIES (mesma logica de ALLOWED_IPS: IP exato ou prefixo).
+    // Atrás de proxy TLS (Cloudflare etc.) o PHP só vê HTTP; o proxy avisa
+    // via X-Forwarded-Proto. Mas qualquer cliente pode forjar esse cabeçalho,
+    // então só confiamos nele quando a requisição veio de um proxy listado
+    // em TRUSTED_PROXIES (mesma lógica de ALLOWED_IPS: IP exato ou prefixo).
     if (TRUSTED_PROXIES !== [] && ip_allowed($_SERVER['REMOTE_ADDR'] ?? '', TRUSTED_PROXIES)) {
         return strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
     }
@@ -209,14 +235,14 @@ function request_is_local(): bool
     return in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true);
 }
 
-/** Chave de fabrica que o gateway se recusa a aceitar em producao. */
+/** Chave de fábrica que o gateway se recusa a aceitar em produção. */
 function placeholder_key(): string
 {
     return 'sk-lr-troque-esta-chave';
 }
 
 /**
- * Recusa servir com a configuracao de fabrica. Um gateway publicado com a
+ * Recusa servir com a configuração de fábrica. Um gateway publicado com a
  * chave de exemplo entrega todas as chaves de provedor para quem achar a URL.
  */
 function gateway_has_placeholder_key(): bool
@@ -240,23 +266,72 @@ function guard_configuration(): void
     }
 }
 
+/** Junta todo o texto da requisição (system + mensagens) para validações. */
+function request_text(array $request): string
+{
+    $parts = [];
+    if (($request['system'] ?? '') !== '') {
+        $parts[] = $request['system'];
+    }
+    foreach ($request['messages'] ?? [] as $message) {
+        foreach ($message['content'] ?? [] as $block) {
+            if (($block['type'] ?? '') === 'text' && ($block['text'] ?? '') !== '') {
+                $parts[] = $block['text'];
+            }
+        }
+    }
+    return implode("\n", $parts);
+}
+
+/** Retorna o primeiro termo de BLOCKED_TERMS encontrado em $text, ou null. */
+function contains_blocked_term(string $text): ?string
+{
+    if (BLOCKED_TERMS === []) {
+        return null;
+    }
+    $haystack = BLOCKED_TERMS_CASE_INSENSITIVE ? mb_strtolower($text) : $text;
+    foreach (BLOCKED_TERMS as $term) {
+        $term = (string) $term;
+        if ($term === '') {
+            continue;
+        }
+        $needle = BLOCKED_TERMS_CASE_INSENSITIVE ? mb_strtolower($term) : $term;
+        $found = match (BLOCKED_TERMS_MATCH_MODE) {
+            'exact'    => $haystack === $needle,
+            'regex'    => @preg_match($term, $text) === 1,
+            default    => str_contains($haystack, $needle), // 'contains'
+        };
+        if ($found) {
+            return $term;
+        }
+    }
+    return null;
+}
+
 // =====================================================================
 // FLUXO PRINCIPAL: NORMALIZA -> ROTACIONA -> RESPONDE
 // =====================================================================
 
-function handle_completion(array $body): void
+function handle_completion(array $body, string $bucket): void
 {
     // Request ID: correlaciona todas as tentativas (provedores, retries,
-    // fallbacks) de uma unica chamada do cliente. Devolvido no header
-    // X-Request-Id para o cliente e gravado em log/metricas — essencial
-    // para depurar "falhou em algum provedor" sem adivinhar qual.
-    $requestId = new_id('req');
-    if (REQUEST_ID_HEADER && !headers_sent()) {
+    // fallbacks) de uma única chamada do cliente. Devolvido no header
+    // X-Request-Id e gravado em log/métricas — essencial para depurar
+    // "falhou em algum provedor" sem adivinhar qual.
+    $requestId = request_id();
+    if (REQUEST_ID_HEADER) {
         header('X-Request-Id: ' . $requestId);
     }
 
     $model = (string) ($body['model'] ?? '');
-    if ($model === '' || !isset(MODELS[$model])) {
+    if (INPUT_BLOCK_CLIENT_MODEL_OVERRIDE) {
+        $chatModels = models_of_type('chat');
+        $model = $chatModels !== [] ? (string) array_key_first($chatModels) : '';
+    }
+    // /chat/completions só atende modelos de tipo 'chat'. Um modelo marcado
+    // 'embedding' (ou outro tipo) aqui devolve 404 — o app pediu no endpoint
+    // errado. MODELS é a única tabela; o filtro por type é o que separa.
+    if ($model === '' || !isset(MODELS[$model]) || model_type(MODELS[$model]) !== 'chat') {
         send_error(404, 'invalid_request_error', 'Modelo nao configurado neste gateway.');
         return;
     }
@@ -266,118 +341,229 @@ function handle_completion(array $body): void
     }
 
     $request = normalize_openai_request($body);
-
     if ($request['messages'] === []) {
         send_error(400, 'invalid_request_error', 'Nenhuma mensagem utilizavel apos a normalizacao.');
         return;
     }
 
-    if (($retryAfter = rate_limited_seconds()) > 0) {
-        http_response_code(429);
-        header('Content-Type: application/json; charset=utf-8');
-        header('Retry-After: ' . $retryAfter);
-        echo json_encode(['error' => [
-            'message' => 'Limite de requisicoes do gateway atingido. Aguarde ' . $retryAfter . 's.',
-            'type' => 'rate_limit_error',
-            'code' => 429,
-        ]], JSON_UNESCAPED_UNICODE);
+    if (INPUT_REJECT_EMPTY_MESSAGE && request_text($request) === '') {
+        send_error(400, 'invalid_request_error', 'Mensagem vazia.');
+        return;
+    }
+    if (INPUT_MAX_CHARS !== null && mb_strlen(request_text($request)) > INPUT_MAX_CHARS) {
+        send_error(400, 'invalid_request_error', 'Entrada acima do limite de caracteres.');
+        return;
+    }
+    if (INPUT_USE_BLOCKED_TERMS && ($term = contains_blocked_term(request_text($request))) !== null) {
+        send_error(400, 'invalid_request_error', 'Entrada contem termo nao permitido.');
         return;
     }
 
-    $candidates = collect_candidates($model);
+    if (($retryAfter = rate_limited_seconds($bucket)) > 0) {
+        // SDKs que respeitam Retry-After esperam o tempo certo sozinhos.
+        header('Retry-After: ' . $retryAfter);
+        send_error(429, 'rate_limit_error', 'Limite de requisicoes do gateway atingido. Aguarde ' . $retryAfter . 's.');
+        return;
+    }
+
+    // Id único do stream para a requisição inteira: numa retomada em outro
+    // provedor o cliente continua vendo um único stream coerente.
+    $streamId   = new_id('chatcmpl');
+    $candidates = collect_candidates($model, MODELS, MODEL_FALLBACKS);
 
     $lastStatus = 503;
     $lastError  = 'Nenhum provedor configurado para este modelo.';
     $attempt    = 0;
-    $partial    = ''; // texto ja enviado ao cliente em stream interrompido
+    $partial    = '';    // texto já enviado ao cliente em stream interrompido
+    $sseOpen    = false; // já emitimos cabeçalhos e eventos SSE?
 
     foreach ($candidates as $candidate) {
         $attempt++;
-        // Cada camada so preenche o que ainda esta em branco, entao aplicar
-        // da mais especifica para a mais generica produz a precedencia:
-        // requisicao > provedor > modelo > DEFAULT_PARAMS.
+        // Precedência: params do modelo > params do provedor > requisição.
+        // O admin que configura o modelo sabe o que o provedor exige; o app
+        // não. Por isso a configuração sobrescreve o que o app enviou.
         $effective = apply_params($request, $candidate['provider']['params'] ?? []);
         $effective = apply_params($effective, $candidate['params']);
-        $effective = apply_params($effective, DEFAULT_PARAMS);
 
-        // system_prompt do modelo: injeta ANTES das mensagens do app. Se o
-        // app tambem enviar system, o do modelo vem primeiro e o do app e
-        // anexado em seguida (precedencia do app mantida no conteudo).
-        $effective = apply_system_prompt($effective, $candidate['system_prompt'] ?? '');
+        // system_prompt do modelo: injeta ANTES das mensagens do app.
+        $effective = apply_system_prompt($effective, $candidate['system_prompt']);
 
-        // Retomada de stream interrompido: se ja enviamos parte da resposta
-        // ao cliente, pedimos ao proximo provedor que CONTINUE a partir de
-        // onde parou, em vez de recomecar do zero (o que duplicaria o texto).
+        // Retomada de stream interrompido: se já enviamos parte da resposta
+        // ao cliente, pedimos ao próximo provedor que CONTINUE a partir de
+        // onde parou, em vez de recomeçar do zero (o que duplicaria o texto).
         if ($partial !== '') {
             $effective = inject_continuation($effective, $partial);
         }
 
-        $result = $effective['stream']
-            ? try_provider_stream($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId)
-            : try_provider_buffered($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId);
+        $result = try_provider($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId, $streamId, $partial);
 
         // Retry do mesmo provedor para falha de rede pura (timeout, DNS,
-        // conexao recusada — status 0, sem HTTP). Esses erros costumam
-        // ser transitivos e baratos de tentar de novo; rotacionar ja
-        // pagaria a latencia de qualquer jeito. So vale para nao-streaming
-        // ja em andamento: se o stream ja emitia bytes, o parcial foi
-        // guardado e a retomada acontece no proximo provedor (nao aqui).
-        if (!$result['done']
-            && $result['status'] === 0
-            && RETRY_SAME_PROVIDER > 0
-            && $partial === ''
-        ) {
-            for ($extra = 1; $extra <= RETRY_SAME_PROVIDER; $extra++) {
-                $result = $effective['stream']
-                    ? try_provider_stream($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId)
-                    : try_provider_buffered($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId);
-                if ($result['done'] || $result['status'] !== 0) {
-                    break;
-                }
-            }
+        // conexão recusada — nenhuma resposta HTTP chegou). Esses erros
+        // costumam ser transitórios e baratos de repetir; rotacionar pagaria
+        // a mesma latência. Não vale depois que o stream já emitiu bytes:
+        // nesse caso a retomada acontece no próximo provedor.
+        for ($extra = 0;
+             $extra < RETRY_SAME_PROVIDER && !$result['done'] && $result['network'] && !$sseOpen && $partial === '';
+             $extra++) {
+            $result = try_provider($candidate['provider'], $effective, $model, $attempt, $candidate['model'], $requestId, $streamId, $partial);
         }
 
+        $sseOpen = $sseOpen || $result['opened'];
         if ($result['done']) {
             return; // resposta ja entregue ao cliente
         }
         $lastStatus = $result['status'];
         $lastError  = $result['error'];
 
-        // Stream caiu no meio: guarda o parcial para o proximo provedor
-        // continuar e mantem o loop vivo — nao aborta a execucao.
-        if (isset($result['partial']) && $result['partial'] !== '') {
-            $partial .= $result['partial'];
+        // Stream caiu depois de já ter emitido um tool_call: retomar seria
+        // pior que parar. O cliente recebeu um "arguments" JSON pela metade
+        // e um segundo provedor abriria outra chamada por cima, deixando
+        // duas ferramentas quebradas no lugar de uma resposta.
+        if ($result['toolCall']) {
+            $lastError = 'stream interrompido no meio de uma chamada de ferramenta';
+            break;
+        }
+
+        // Stream de texto caiu no meio: guarda o parcial para o próximo
+        // provedor continuar e mantém o loop vivo.
+        $partial .= $result['partial'];
+
+        // Orçamento de tempo estourado: parar aqui é melhor que abrir mais
+        // uma tentativa que já nasceria sem tempo de terminar.
+        if (deadline_exceeded()) {
+            $lastError = 'tempo limite da requisicao (' . TOTAL_DEADLINE_SECONDS . 's) esgotado. Ultimo erro: ' . $lastError;
+            break;
         }
     }
 
-    // Lista esgotada. Se ja haviamos emitido bytes em stream, o cliente
-    // recebeu o que deu; fechamos o SSE com [DONE] (nao cabe um JSON de
-    // erro por cima de um stream em andamento). Sem stream, devolve erro.
-    if ($partial !== '') {
+    // Lista esgotada. Com o SSE já aberto não cabe um JSON de erro por cima
+    // do stream: manda o erro como evento e fecha. Sem isso o cliente ficaria
+    // esperando um terminador que nunca vem, ou leria JSON no meio do SSE.
+    $message = 'Todos os provedores falharam. Ultimo erro: ' . $lastError;
+    if ($sseOpen) {
+        echo sse(['error' => ['message' => $message, 'type' => 'upstream_error', 'code' => $lastStatus]]);
         echo "data: [DONE]\n\n";
         flush();
         return;
     }
-    send_error(
-        $lastStatus >= 400 && $lastStatus < 600 ? $lastStatus : 502,
-        'upstream_error',
-        'Todos os provedores falharam. Ultimo erro: ' . $lastError
-    );
+    send_final_error($lastStatus, $message, $attempt);
 }
 
 /**
- * Injeta o conteudo parcial ja enviado ao cliente como uma mensagem
- * assistant, seguida de uma instrucao de sistema pedindo a continuacao.
- * Assim o proximo provedor retoma de onde o anterior parou, sem duplicar.
+ * Erro depois de esgotar a fila. Status 400 vira invalid_request_error
+ * porque a causa está no que o cliente mandou, não nos provedores — quem
+ * lê o erro precisa saber onde procurar. X-Router-Attempts diz quantos
+ * provedores foram tentados antes de desistir.
+ */
+function send_final_error(int $lastStatus, string $message, int $attempts): void
+{
+    if (!headers_sent()) {
+        header('X-Router-Attempts: ' . $attempts);
+    }
+    $status = $lastStatus >= 400 && $lastStatus < 600 ? $lastStatus : 502;
+    send_error($status, $status === 400 ? 'invalid_request_error' : 'upstream_error', $message);
+}
+
+/**
+ * POST /embeddings — mesma rotação de provedores do chat, corpo bem mais
+ * simples. Não há forma canônica nem streaming: o payload de embeddings é
+ * igual em todo provedor de dialeto openai, então normalizamos a entrada,
+ * trocamos o id do modelo e repassamos a resposta com o nome do gateway.
+ */
+function handle_embedding(array $body, string $bucket): void
+{
+    // /embeddings só atende modelos de tipo 'embedding'. O catálogo é o
+    // mesmo MODELS; o filtro por type é o que separa os endpoints.
+    $embeddings = models_of_type('embedding');
+    if ($embeddings === []) {
+        send_error(404, 'not_found', 'Nenhum modelo de embedding configurado (type=embedding em MODELS).');
+        return;
+    }
+
+    $requestId = request_id();
+    if (REQUEST_ID_HEADER) {
+        header('X-Request-Id: ' . $requestId);
+    }
+
+    $model = (string) ($body['model'] ?? '');
+    if ($model === '' || !isset($embeddings[$model])) {
+        send_error(404, 'invalid_request_error', 'Modelo de embedding nao configurado neste gateway.');
+        return;
+    }
+    if (!embedding_input_is_valid($body['input'] ?? null)) {
+        send_error(400, 'invalid_request_error', 'Campo "input" ausente ou vazio.');
+        return;
+    }
+    if (($retryAfter = rate_limited_seconds($bucket)) > 0) {
+        header('Retry-After: ' . $retryAfter);
+        send_error(429, 'rate_limit_error', 'Limite de requisicoes do gateway atingido. Aguarde ' . $retryAfter . 's.');
+        return;
+    }
+
+    $lastStatus = 503;
+    $lastError  = 'Nenhum provedor configurado para este modelo.';
+    $attempt    = 0;
+
+    foreach (collect_candidates($model, $embeddings, []) as $candidate) {
+        $attempt++;
+        $provider = $candidate['provider'];
+        if ($provider['type'] === 'anthropic') {
+            continue; // a API Anthropic não tem endpoint de embeddings
+        }
+        // Sobrescreve a rota: o mesmo call_provider serve os dois endpoints.
+        $provider['endpoint'] = 'embeddings';
+
+        $started = microtime(true);
+        $result  = call_provider($provider, build_embedding_payload($body, $provider['model']), null);
+        $ms      = (int) round((microtime(true) - $started) * 1000);
+
+        if ($result['status'] === 200) {
+            $decoded = json_decode($result['body'], true);
+            if (embedding_response_is_usable($decoded)) {
+                $decoded['model'] = $model; // o cliente pediu o nome do gateway
+                log_attempt($candidate['model'], $provider, 200, $ms, 'ok-embedding', $requestId, [
+                    'input'  => (int) ($decoded['usage']['prompt_tokens'] ?? 0),
+                    'output' => 0,
+                ]);
+                breaker_success($provider);
+                send_router_headers($provider, $attempt);
+                send_json(200, $decoded);
+                return;
+            }
+            // Mesmo critério do chat: 200 sem vetor é falha, não resposta.
+            $result['status'] = 502;
+        }
+
+        $lastError  = failure_reason($result);
+        $lastStatus = $result['status'] ?: 502;
+        log_attempt($candidate['model'], $provider, $result['status'], $ms, $lastError, $requestId);
+        mark_failure($provider, $result);
+
+        if (deadline_exceeded()) {
+            $lastError = 'tempo limite da requisicao esgotado. Ultimo erro: ' . $lastError;
+            break;
+        }
+    }
+
+    send_final_error($lastStatus, 'Todos os provedores falharam. Ultimo erro: ' . $lastError, $attempt);
+}
+
+/** Despacha para o caminho com ou sem streaming. */
+function try_provider(array $provider, array $request, string $model, int $attempt, string $logModel, string $requestId, string $streamId, string $partial = ''): array
+{
+    return $request['stream']
+        ? try_provider_stream($provider, $request, $model, $attempt, $logModel, $requestId, $streamId, $partial)
+        : try_provider_buffered($provider, $request, $model, $attempt, $logModel, $requestId);
+}
+
+/**
+ * Acrescenta o texto já enviado ao cliente como mensagem assistant e pede a
+ * continuação, para o próximo provedor retomar de onde o anterior parou.
  *
- * Detalhes que importam para o provedor receber a sessao inteira:
- *  - $request ja carrega TODAS as mensagens originais (system + historico
- *    + pergunta atual); so acrescentamos o parcial no final.
- *  - A instrucao de continuacao vai no system, nao como turno de usuario,
- *    para nao poluir o contexto nem confundir a alternancia de papeis.
- *  - tool_choice e forçado para 'none': queremos prosa, nao tool call.
- *    As tools seguem no payload (caso o modelo precise de contexto), mas
- *    o provedor nao pode decidir chamar uma ferramenta no meio da retomada.
+ * $request já carrega o histórico inteiro; só o parcial entra no fim. A
+ * instrução vai no system, não como turno de usuário, para não confundir a
+ * alternância de papéis. tool_choice vira 'none': as tools seguem no payload
+ * como contexto, mas o provedor não pode abrir uma chamada no meio da emenda.
  */
 function inject_continuation(array $request, string $partial): array
 {
@@ -393,17 +579,54 @@ function inject_continuation(array $request, string $partial): array
         ? $instruction
         : $request['system'] . "\n\n" . $instruction;
 
-    // Forca texto: a retomada nao pode virar chamada de ferramenta.
     $request['tool_choice'] = 'none';
 
     return $request;
 }
 
+/** Um modelo aceita a lista simples de provedores ou ['params'=>..., 'providers'=>...]. */
+function model_entries(array $config): array
+{
+    $entries = is_array($config['providers'] ?? null) ? $config['providers'] : $config;
+    return array_values(array_filter($entries, 'is_array'));
+}
+
+/**
+ * Tipo de um modelo (chat, embedding, e futuros). Distinto do dialeto do
+ * provedor (openai/anthropic), que vive em PROVIDERS. Ausente = 'chat'.
+ * Válido em runtime: qualquer valor não reconhecido cai em 'chat' para não
+ * quebrar configurações antigas — php index.php check aponta o typo.
+ */
+function model_type(array $config): string
+{
+    $type = (string) ($config['type'] ?? 'chat');
+    return in_array($type, MODEL_TYPES, true) ? $type : 'chat';
+}
+
+/**
+ * Subconjunto de MODELS cujo 'type' casa o pedido. Usado por /chat e
+ * /embeddings para rotear só os modelos do tipo certo, e por /models para
+ * listar com owned_by distinto por tipo.
+ */
+function models_of_type(string $type): array
+{
+    $out = [];
+    foreach (MODELS as $name => $config) {
+        if (model_type($config) === $type) {
+            $out[$name] = $config;
+        }
+    }
+    return $out;
+}
+
 /**
  * Monta a fila de tentativas: provedores do modelo pedido, depois os do
- * fallback (se houver), pulando quem esta de castigo, ate MAX_ATTEMPTS.
+ * fallback (se houver), pulando quem está de castigo, até MAX_ATTEMPTS.
+ *
+ * O catálogo é parâmetro porque /embeddings usa a mesma rotação com o
+ * subconjunto de MODELS cujo type é 'embedding' e sem fallback entre modelos.
  */
-function collect_candidates(string $model): array
+function collect_candidates(string $model, array $catalog, array $fallbacks): array
 {
     $candidates = [];
     $queue      = [$model];
@@ -411,30 +634,29 @@ function collect_candidates(string $model): array
 
     while ($queue !== []) {
         $current = array_shift($queue);
-        if (isset($visited[$current]) || !isset(MODELS[$current])) {
+        if (isset($visited[$current]) || !isset($catalog[$current])) {
             continue; // protege contra ciclo A->B->A no MODEL_FALLBACKS
         }
         $visited[$current] = true;
 
-        // O modelo aceita duas formas: lista simples de provedores, ou
-        // ['params' => [...], 'providers' => [...]].
-        $config       = MODELS[$current];
-        $entries      = is_array($config['providers'] ?? null) ? $config['providers'] : $config;
+        $config       = $catalog[$current];
         $modelParams  = is_array($config['params'] ?? null) ? $config['params'] : [];
         $systemPrompt = is_string($config['system_prompt'] ?? null) ? trim($config['system_prompt']) : '';
 
         // Resolve cada entrada contra PROVIDERS antes de ordenar; entrada
-        // com referencia quebrada e ignorada (php index.php check aponta).
+        // com referência quebrada é ignorada (php index.php check aponta).
+        // Uma entrada com 'key' em array vira N candidatos idênticos, cada
+        // um com sua chave — é como cadastrar várias contas do mesmo
+        // serviço sem repetir a entrada. Cada expansão ganha sufixo '#N'.
         $resolved = [];
-        foreach ($entries as $entry) {
-            $provider = resolve_provider($entry);
-            if ($provider !== null) {
+        foreach (model_entries($config) as $entry) {
+            foreach (resolve_provider($entry) as $provider) {
                 $resolved[] = $provider;
             }
         }
 
         // Pula provedores remotos sem chave em runtime: a chamada iria falhar
-        // no 401 e gastar uma tentativa a toa. Provedores locais (Ollama)
+        // no 401 e gastar uma tentativa à toa. Provedores locais (Ollama)
         // rodam sem chave legitimamente e seguem na fila.
         if (SKIP_EMPTY_REMOTE_KEY) {
             $resolved = array_values(array_filter(
@@ -443,9 +665,15 @@ function collect_candidates(string $model): array
             ));
         }
 
-        // 'random' sorteia DENTRO do modelo respeitando o peso de cada
-        // provedor; o fallback vem sempre depois. 'priority' segue o array.
-        $ordered = STRATEGY === 'random' ? weighted_shuffle($resolved) : $resolved;
+        // Ordem DENTRO do modelo; o fallback entre modelos vem sempre depois.
+        //   priority -> ordem do array
+        //   random   -> sorteio ponderado pelo weight
+        //   fastest  -> menor latência medida na janela de métricas
+        $ordered = match (STRATEGY) {
+            'random'  => weighted_shuffle($resolved),
+            'fastest' => fastest_first($resolved),
+            default   => $resolved,
+        };
         foreach ($ordered as $provider) {
             $candidates[] = [
                 'model'         => $current,
@@ -455,26 +683,27 @@ function collect_candidates(string $model): array
             ];
         }
 
-        $fallback = MODEL_FALLBACKS[$current] ?? null;
+        $fallback = $fallbacks[$current] ?? null;
         if (is_string($fallback) && $fallback !== '') {
             $queue[] = $fallback;
         }
     }
 
-    if (COOLDOWN_SECONDS > 0 || BREAKER_FAILURES > 0) {
-        $state = state_read();
-        $alive = array_values(array_filter(
-            $candidates,
-            static fn (array $c): bool => !cooldown_active($c['provider'], $state)
-                && !breaker_is_open($c['provider'], $state)
-        ));
-        // Todos de castigo/abertos? Ignora: tentar e melhor que falhar parado.
-        if ($alive !== []) {
-            $candidates = $alive;
-        }
+    // Castigo, circuito aberto e cota diária estourada tiram o provedor da
+    // fila. Se TODOS caírem, ignora o filtro: tentar é melhor que falhar
+    // parado — o estado é uma estimativa nossa, não a verdade do provedor.
+    $state = state_read();
+    $alive = array_values(array_filter(
+        $candidates,
+        static fn (array $c): bool => !cooldown_active($c['provider'], $state)
+            && !breaker_is_open($c['provider'], $state)
+            && !quota_exhausted($c['provider'], $state)
+    ));
+    if ($alive !== []) {
+        $candidates = $alive;
     }
 
-    // MAX_ATTEMPTS e aplicado POR MODELO, nao sobre a fila inteira: assim o
+    // MAX_ATTEMPTS é aplicado POR MODELO, não sobre a fila inteira: assim o
     // fallback entre modelos (MODEL_FALLBACKS) continua valendo mesmo quando
     // o modelo principal tem provedores suficientes para esgotar o teto sozinho.
     if (MAX_ATTEMPTS > 0) {
@@ -482,21 +711,18 @@ function collect_candidates(string $model): array
         foreach ($candidates as $candidate) {
             $perModel[$candidate['model']][] = $candidate;
         }
-        $candidates = [];
-        foreach ($perModel as $group) {
-            foreach (array_slice($group, 0, MAX_ATTEMPTS) as $candidate) {
-                $candidates[] = $candidate;
-            }
-        }
+        $candidates = array_merge(...array_map(
+            static fn (array $group): array => array_slice($group, 0, MAX_ATTEMPTS),
+            array_values($perModel)
+        ) ?: [[]]);
     }
     return $candidates;
 }
 
 /**
  * Injeta o system_prompt do modelo ANTES do system que o app enviou.
- * Se o modelo nao definir system_prompt, devolve $request intacto.
- * Precedencia do app e mantida: o conteudo que o app passou vem depois
- * (mais forte na pratica, pois modelos dao peso a ordem do prompt).
+ * Precedência do app é mantida: o conteúdo que o app passou vem depois
+ * (mais forte na prática, pois modelos dão peso à ordem do prompt).
  */
 function apply_system_prompt(array $request, string $systemPrompt): array
 {
@@ -510,42 +736,38 @@ function apply_system_prompt(array $request, string $systemPrompt): array
 }
 
 /**
- * Preenche parametros que ainda nao foram definidos. Nunca sobrescreve:
- * o que o app enviou vale mais que a configuracao, sempre. Para forcar um
- * valor independentemente do que o app pedir, troque as verificacoes de
- * "esta em branco" por atribuicao direta.
+ * Aplica parâmetros de configuração (provedor ou modelo) sobre a requisição.
+ * SEMPRE sobrescreve o que o app enviou: o admin que configura o modelo
+ * sabe o que o provedor exige; o app não. Para deixar o provedor decidir,
+ * basta não definir o parâmetro (null = "sem opinião").
  */
 function apply_params(array $request, array $params): array
 {
     foreach ($params as $name => $value) {
         if ($value === null || $value === []) {
-            continue; // "sem opiniao": deixa a proxima camada decidir
+            continue; // "sem opinião": não envia, provedor aplica o padrão dele
         }
         switch ($name) {
             case 'temperature':
             case 'top_p':
-                if ($request['params'][$name] === null) {
-                    $request['params'][$name] = num_or_null($value);
-                }
+                $request['params'][$name] = num_or_null($value);
                 break;
             case 'top_k':
             case 'max_tokens':
-                if ($request['params'][$name] === null) {
-                    $request['params'][$name] = int_or_null($value);
-                }
+                $request['params'][$name] = int_or_null($value);
                 break;
             case 'stop':
             case 'stop_sequences':
-                if ($request['params']['stop'] === []) {
-                    $request['params']['stop'] = stop_list($value);
-                }
+                $request['params']['stop'] = stop_list($value);
                 break;
             default:
-                // Demais parametros seguem a regra do passthrough: so valem
-                // para provedores openai e so se estiverem na allowlist.
-                if (in_array($name, PASSTHROUGH_OPENAI, true) && !array_key_exists($name, $request['extra'])) {
-                    $request['extra'][$name] = $value;
-                }
+                // Demais parâmetros seguem para 'extra', injetado no payload
+                // dos provedores openai. Diferente do passthrough da
+                // REQUISIÇÃO DO CLIENTE — filtrado por PASSTHROUGH_OPENAI por
+                // segurança — o que o admin define no config.php aceita
+                // qualquer nome: é o que permite campos próprios de provedores
+                // exóticos (Modal, vLLM, LM Studio).
+                $request['extra'][$name] = $value;
                 break;
         }
     }
@@ -554,81 +776,128 @@ function apply_params(array $request, array $params): array
 
 /**
  * Junta a entrada do modelo com a URL e o tipo do provedor nomeado em
- * PROVIDERS. A entrada do modelo traz key e model; a URL e o type vem do
- * catalogo PROVIDERS. A entrada tem a ultima palavra, entao da para
- * sobrescrever a URL pontualmente sem duplicar o provedor.
+ * PROVIDERS. A entrada do modelo traz o id do modelo naquele provedor e,
+ * opcionalmente, uma chave própria; url e type vêm sempre do catálogo.
+ * Devolve uma LISTA porque 'key' em array expande em N candidatos.
  */
-function resolve_provider(array $entry): ?array
+function resolve_provider(array $entry): array
 {
     $name = (string) ($entry['provider'] ?? '');
     if ($name !== '') {
         if (!isset(PROVIDERS[$name])) {
-            return null; // referencia quebrada
+            return []; // referencia quebrada
         }
-        // PROVIDERS[$name] e ['url' => ..., 'type' => 'openai'|'anthropic'].
-        // type default 'openai' quando omitido no catalogo.
-        $catalog     = PROVIDERS[$name];
-        $entry['url']  = (string) ($catalog['url'] ?? '');
+        // A key do provedor é o PADRÃO; a entrada de MODELS pode sobrescrever
+        // pontualmente (conta diferente do mesmo serviço).
+        $catalog       = PROVIDERS[$name];
+        $entry['url']  = trim((string) ($catalog['url'] ?? ''));
         $entry['type'] = (string) ($catalog['type'] ?? 'openai');
+        $entry['rpd']  = (int) ($catalog['rpd'] ?? 0);
+        $entry['key'] ??= $catalog['key'] ?? '';
+        // Retry de cold start (serverless): vem do catálogo, a entrada de
+        // MODELS pode sobrescrever se um modelo precisar de outro ritmo.
+        $entry['retries']     ??= $catalog['retries'] ?? 0;
+        $entry['retry_delay'] ??= $catalog['retry_delay'] ?? 10;
     }
     if (($entry['url'] ?? '') === '' || ($entry['model'] ?? '') === '') {
-        return null;
+        return [];
     }
-    // type default 'openai' quando o provedor e inline (sem nome em PROVIDERS).
+    // type default 'openai' quando o provedor é inline (sem nome em PROVIDERS).
     if (($entry['type'] ?? '') === '') {
         $entry['type'] = 'openai';
     }
-    // Rotulo usado em log, header e cooldown. O nome distingue duas contas
-    // no mesmo host (openrouter1 x openrouter2), coisa que a url nao faz.
-    $entry['label'] = $name !== '' ? $name : (parse_url((string) $entry['url'], PHP_URL_HOST) ?: 'inline');
-    return $entry;
+    // Rótulo base usado em log, header e cooldown. O nome distingue duas
+    // contas no mesmo host (openrouter1 x openrouter2), coisa que a url
+    // não faz. Quando 'key' é array, cada expansão ganha um sufixo '#N'.
+    $baseLabel = $name !== '' ? $name : (parse_url((string) $entry['url'], PHP_URL_HOST) ?: 'inline');
+
+    $keys = $entry['key'] ?? '';
+    if (is_array($keys)) {
+        $keys = array_values(array_filter(array_map('strval', $keys), static fn (string $k): bool => $k !== ''));
+        // Array só com vazios: em runtime não há nada a expandir. Mas para
+        // diagnóstico (php index.php check) preservamos 1 entrada com key=''
+        // para o erro apontar "key vazia" em vez de "entrada incompleta".
+        $keys = $keys !== [] ? $keys : [''];
+    } else {
+        $keys = [(string) $keys];
+    }
+
+    $expanded = [];
+    $multiple = count($keys) > 1;
+    foreach ($keys as $index => $key) {
+        $expanded[] = ['key' => $key, 'label' => $multiple ? $baseLabel . '#' . ($index + 1) : $baseLabel] + $entry;
+    }
+    return $expanded;
 }
 
 /**
- * Provedores locais (Ollama, LM Studio, vLLM na mesma maquina) rodam sem
- * chave legitimamente. Usado para nao pular/avisar esses quando a chave
- * esta vazia — so pulamos/avisamos provedores remotos sem chave.
+ * Provedores locais (Ollama, LM Studio, vLLM na mesma máquina) rodam sem
+ * chave legitimamente. Usado para não pular nem avisar sobre esses quando
+ * a chave está vazia — só pulamos/avisamos provedores remotos sem chave.
  */
 function provider_is_local(string $url): bool
 {
-    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
-    return $host === '127.0.0.1'
-        || $host === '::1'
-        || $host === 'localhost'
+    $host = strtolower((string) parse_url(trim($url), PHP_URL_HOST));
+    return in_array($host, ['127.0.0.1', '::1', 'localhost'], true)
         || str_ends_with($host, '.localhost');
 }
 
 /**
- * Sorteio ponderado sem reposicao: um provedor com weight 9 abre a fila em
- * ~9 de cada 10 requisicoes, mas todos sempre entram na ordem final —
- * o peso muda a frequencia, nunca a disponibilidade. Sem weight, vale 1.
+ * Sorteio ponderado sem reposição (Efraimidis-Spirakis): cada provedor
+ * ganha a chave u^(1/peso) com u uniforme em (0,1]; ordenar por ela em
+ * ordem decrescente dá exatamente a distribuição desejada. Um provedor
+ * com weight 9 abre a fila em ~9 de cada 10 requisições, mas todos
+ * continuam na ordem final — o peso muda a frequência, nunca a
+ * disponibilidade. Sem weight, vale 1.
  */
 function weighted_shuffle(array $providers): array
 {
-    $pool    = array_values($providers);
-    $ordered = [];
-    while ($pool !== []) {
-        $total = 0;
-        foreach ($pool as $provider) {
-            $total += max(1, (int) ($provider['weight'] ?? 1));
-        }
-        $pick        = random_int(1, $total);
-        $accumulated = 0;
-        foreach ($pool as $index => $provider) {
-            $accumulated += max(1, (int) ($provider['weight'] ?? 1));
-            if ($pick <= $accumulated) {
-                $ordered[] = $provider;
-                unset($pool[$index]);
-                $pool = array_values($pool);
-                break;
-            }
+    $providers = array_values($providers);
+    $keys      = [];
+    foreach ($providers as $index => $provider) {
+        $weight       = max(1, (int) ($provider['weight'] ?? 1));
+        $keys[$index] = (random_int(1, PHP_INT_MAX) / PHP_INT_MAX) ** (1 / $weight);
+    }
+    arsort($keys);
+    return array_map(static fn (int $index): array => $providers[$index], array_keys($keys));
+}
+
+/**
+ * Ordena pelo p50 da janela de métricas, do mais rápido para o mais lento.
+ *
+ * Provedor ainda sem medição recebe a média dos demais: entra no meio da
+ * fila e vai sendo amostrado, sem furar a frente de quem já provou ser
+ * rápido nem ficar esquecido no fim. Sem métricas, mantém a ordem do array.
+ */
+function fastest_first(array $providers): array
+{
+    $snapshot = metrics_snapshot();
+    if ($snapshot === []) {
+        return $providers;
+    }
+
+    $known = [];
+    foreach ($providers as $index => $provider) {
+        $p50 = (int) ($snapshot[$provider['label']]['p50_ms'] ?? 0);
+        if ($p50 > 0) {
+            $known[$index] = $p50;
         }
     }
-    return $ordered;
+    if ($known === []) {
+        return $providers;
+    }
+    $average = (int) round(array_sum($known) / count($known));
+
+    $order = [];
+    foreach ($providers as $index => $provider) {
+        $order[$index] = $known[$index] ?? $average;
+    }
+    asort($order);
+    return array_map(static fn (int $index): array => $providers[$index], array_keys($order));
 }
 
 /** Tentativa sem streaming: resposta completa, converte e devolve. */
-function try_provider_buffered(array $provider, array $request, string $model, int $attempt, string $logModel, string $requestId = ''): array
+function try_provider_buffered(array $provider, array $request, string $model, int $attempt, string $logModel, string $requestId): array
 {
     $payload = build_payload($request, $provider);
     $started = microtime(true);
@@ -637,120 +906,238 @@ function try_provider_buffered(array $provider, array $request, string $model, i
 
     if ($result['status'] === 200) {
         $decoded = json_decode($result['body'], true);
-        if (is_array($decoded)) {
-            $canonical = $provider['type'] === 'openai'
+        $canonical = is_array($decoded)
+            ? ($provider['type'] === 'openai'
                 ? canonical_from_openai_response($decoded)
-                : canonical_from_anthropic_response($decoded);
-            log_attempt($logModel, $provider, 200, $ms, 'ok', $requestId);
+                : canonical_from_anthropic_response($decoded))
+            : null;
+
+        if ($canonical !== null && canonical_is_usable($canonical)) {
+            log_attempt($logModel, $provider, 200, $ms, 'ok', $requestId, $canonical['usage']);
             breaker_success($provider);
-            send_router_headers($provider, $attempt);
+            send_router_headers($provider, $attempt, $logModel, $model);
             send_json(200, render_openai_response($canonical, $model));
-            return ['done' => true, 'status' => 200, 'error' => ''];
+            return provider_result(true, 200, '');
         }
+
+        // 200 sem resposta utilizável é falha de provedor, não sucesso:
+        // vira 5xx para entrar no cooldown/breaker e rotacionar.
         $result['status'] = 502;
-        $result['error']  = 'resposta nao e JSON valido';
+        $result['body']   = $canonical === null
+            ? json_encode(['error' => ['message' => 'resposta nao e JSON valido']])
+            : ($result['body'] !== '' ? $result['body'] : json_encode(['error' => ['message' => 'resposta vazia']]));
     }
 
     $reason = failure_reason($result);
     log_attempt($logModel, $provider, $result['status'], $ms, $reason, $requestId);
-    if (transient_failure($result)) {
-        cooldown_mark($provider);
-        breaker_failure($provider, $result['status'] === 0);
-    }
-    return ['done' => false, 'status' => $result['status'] ?: 502, 'error' => $reason];
+    mark_failure($provider, $result);
+    return provider_result(false, $result['status'] ?: 502, $reason, '', false, $result['status'] === 0);
 }
 
 /**
- * Tentativa com streaming. Nada e enviado ao cliente antes do HTTP 200 do
- * provedor, entao rate limit e erro continuam rotacionando normalmente.
- * Se o provedor cair no meio do stream, NAO aborta: devolve o parcial para
- * o caller tentar o proximo provedor (que continua de onde parou). So
- * aborta de verdade se foi o CLIENTE que desconectou — nesse caso nao ha
- * sentido em tentar de novo, ninguem esta lendo.
+ * Tentativa com streaming. Nada sai para o cliente antes do 200 do provedor
+ * E do primeiro evento útil, então rate limit e erro continuam rotacionando.
+ *
+ * Provedor que cai no meio não aborta a requisição: o parcial volta para o
+ * caller tentar o próximo. Só encerra de verdade se foi o CLIENTE que
+ * desconectou — nesse caso não há para quem continuar.
  */
-function try_provider_stream(array $provider, array $request, string $model, int $attempt, string $logModel, string $requestId = ''): array
+function try_provider_stream(array $provider, array $request, string $model, int $attempt, string $logModel, string $requestId, string $streamId, string $partial = ''): array
 {
     $payload    = build_payload($request, $provider);
-    $translator = make_translator(
-        $provider['type'],
-        $model,
-        !empty($request['stream_options']['include_usage'])
-    );
-    $started    = microtime(true);
-    $emitting   = false;
+    $translator = make_translator($provider['type'], $model, $streamId, !empty($request['stream_options']['include_usage']));
+    if ($partial !== '') {
+        // Continuação: o tradutor corta a repetição do final do texto anterior.
+        $translator->continuing($partial);
+    }
+    $started = microtime(true);
+    $opened  = false;
 
-    $result = call_provider($provider, $payload, function (string $chunk) use (&$emitting, $translator, $provider, $attempt): void {
-        if (!$emitting) {
-            // Headers so na primeira emissao; numa retomada de stream
-            // interrompido os headers SSE ja foram enviados pelo provedor
-            // anterior e chamar header() de novo so geraria warning.
+    $emit = function (string $output) use (&$opened, $provider, $attempt, $logModel, $model): void {
+        if (!$opened) {
+            // Headers só na primeira emissão. Numa retomada de stream
+            // interrompido eles já foram enviados pela tentativa anterior.
             if (!headers_sent()) {
-                send_router_headers($provider, $attempt);
+                send_router_headers($provider, $attempt, $logModel, $model);
                 send_stream_headers();
             }
-            $emitting = true;
+            $opened = true;
         }
-        echo $translator->push($chunk);
+        echo $output;
         flush();
+    };
+
+    $result = call_provider($provider, $payload, function (string $chunk) use ($translator, $emit): void {
+        // Chunk vazio é a batida de heartbeat de call_provider: não veio nada
+        // do provedor há um tempo. Manda um comentário SSE para o proxy não
+        // derrubar a conexão enquanto o modelo "pensa".
+        if ($chunk === '') {
+            $emit(sse_heartbeat());
+            return;
+        }
+        $output = $translator->push($chunk);
+        if ($output !== '') {
+            $emit($output);
+        }
     });
 
     $ms = (int) round((microtime(true) - $started) * 1000);
 
-    if ($emitting) {
-        if ($result['status'] === 200 && $result['error'] === '') {
-            // Stream completo: fecha e encerra.
-            echo $translator->finish();
-            log_attempt($logModel, $provider, 200, $ms, 'ok-stream', $requestId);
+    // Sucesso exige o terminador do provedor. Sem essa checagem, um provedor
+    // que fecha a conexão no meio do stream produziria um curl "bem-sucedido"
+    // e o cliente receberia meia resposta achando que era a resposta inteira.
+    if ($result['status'] === 200 && $result['error'] === '' && $translator->isComplete()) {
+        echo $translator->finish();
+        flush();
+        log_attempt($logModel, $provider, 200, $ms, 'ok-stream', $requestId, $translator->usage());
+        breaker_success($provider);
+        return provider_result(true, 200, '', '', $opened);
+    }
+
+    // Provedor ignorou stream:true e devolveu uma resposta JSON normal
+    // (acontece em setups de vLLM e LM Studio). O conteúdo está correto —
+    // só não veio no formato pedido. Reemite como stream em vez de queimar
+    // a fila inteira por causa do formato.
+    if (!$opened && $result['status'] === 200 && $result['error'] === '' && !$translator->isComplete()) {
+        $salvaged = stream_from_json($translator->rawBody(), $provider, $model, $streamId);
+        if ($salvaged !== null) {
+            if (!headers_sent()) {
+                send_router_headers($provider, $attempt, $logModel, $model);
+                send_stream_headers();
+            }
+            echo $salvaged['sse'];
+            flush();
+            log_attempt($logModel, $provider, 200, $ms, 'ok-stream-convertido', $requestId, $salvaged['usage']);
             breaker_success($provider);
-            flush();
-            return ['done' => true, 'status' => 200, 'error' => ''];
+            return provider_result(true, 200, '', '', true);
         }
+    }
 
-        // Stream caiu no meio. Se foi o cliente que saiu, nao ha o que
-        // fazer — ninguem vai ler a continuacao. Encerra e fecha o fluxo.
-        if (connection_aborted()) {
-            log_attempt($logModel, $provider, $result['status'], $ms, 'cliente-desconectou', $requestId);
-            flush();
-            return ['done' => true, 'status' => 200, 'error' => ''];
-        }
+    // Cliente saiu no meio: ninguém vai ler a continuação. Encerra.
+    if ($opened && connection_aborted()) {
+        log_attempt($logModel, $provider, $result['status'], $ms, 'cliente-desconectou', $requestId);
+        return provider_result(true, 200, '', '', true);
+    }
 
-        // Provedor caiu mas o cliente continua: NAO fecha o stream. Pega
-        // o texto ja emitido e devolve para o caller injetar como
-        // continuacao no proximo provedor. O loop em handle_completion
-        // cuida de tentar de novo sem duplicar o que ja foi enviado.
-        $partial = $translator->emittedText();
-        log_attempt($logModel, $provider, $result['status'], $ms, 'stream-interrompido', $requestId);
-        if (transient_failure($result)) {
-            cooldown_mark($provider);
-            breaker_failure($provider, $result['status'] === 0);
-        }
-        // done=false mantem o loop vivo; partial alimenta a retomada.
-        // Nao chamamos flush() nem finish()/abort() aqui: o stream SSE
-        // segue aberto para o proximo provedor continuar escrevendo.
-        return [
-            'done'    => false,
-            'status'  => $result['status'] ?: 502,
-            'error'   => 'stream-interrompido',
-            'partial' => $partial,
+    // Orçamento total estourado no meio do stream: o curl foi abortado por
+    // nós, não pelo provedor. Diz isso no log em vez de culpar a rede.
+    if (deadline_exceeded()) {
+        log_attempt($logModel, $provider, $result['status'], $ms, 'tempo-esgotado', $requestId);
+        return provider_result(false, 504, 'tempo limite da requisicao esgotado', $translator->emittedText(), $opened);
+    }
+
+    $network = $result['status'] === 0;
+
+    // 200 que não completou não tem status de erro próprio (o 200 já veio).
+    // Vira 502 para o resto do fluxo enxergar uma falha de provedor de
+    // verdade — e entrar no cooldown e no breaker como qualquer outra.
+    if ($result['status'] === 200 && $result['error'] === '') {
+        $upstream = $translator->upstreamError();
+        $result   = [
+            'status' => 502,
+            'error'  => '',
+            'body'   => json_encode(['error' => ['message' => $upstream !== '' ? $upstream : 'stream encerrado sem terminador']]),
         ];
     }
 
     $reason = failure_reason($result);
-    log_attempt($logModel, $provider, $result['status'], $ms, $reason, $requestId);
-    if (transient_failure($result)) {
-        cooldown_mark($provider);
-        breaker_failure($provider, $result['status'] === 0);
+    log_attempt($logModel, $provider, $result['status'], $ms, $opened ? 'stream-interrompido' : $reason, $requestId);
+    mark_failure($provider, $result);
+
+    // done=false mantém o loop vivo; partial alimenta a retomada. Não
+    // chamamos finish() aqui: o stream SSE segue aberto para o próximo
+    // provedor continuar escrevendo de onde este parou.
+    return provider_result(
+        false,
+        $result['status'] ?: 502,
+        $reason,
+        $translator->emittedText(),
+        $opened,
+        $network,
+        $translator->emittedToolCall()
+    );
+}
+
+/**
+ * Converte uma resposta buferizada em chunks SSE. Devolve null quando o
+ * corpo não é uma resposta aproveitável — aí o caminho normal de falha
+ * assume e o router rotaciona.
+ */
+function stream_from_json(string $body, array $provider, string $model, string $streamId): ?array
+{
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded)) {
+        return null;
     }
-    return ['done' => false, 'status' => $result['status'] ?: 502, 'error' => $reason];
+    $canonical = $provider['type'] === 'openai'
+        ? canonical_from_openai_response($decoded)
+        : canonical_from_anthropic_response($decoded);
+    if (!canonical_is_usable($canonical)) {
+        return null;
+    }
+
+    $rendered = render_openai_response($canonical, $model);
+    $message  = $rendered['choices'][0]['message'];
+    $delta    = ['role' => 'assistant'];
+    foreach (['content', 'reasoning_content', 'tool_calls'] as $field) {
+        if (!empty($message[$field])) {
+            $delta[$field] = $message[$field];
+        }
+    }
+    $chunk = static fn (array $d, ?string $stop): string => sse([
+        'id'      => $streamId,
+        'object'  => 'chat.completion.chunk',
+        'created' => time(),
+        'model'   => $model,
+        'choices' => [['index' => 0, 'delta' => (object) $d, 'finish_reason' => $stop]],
+    ]);
+
+    return [
+        'sse'   => $chunk($delta, null) . $chunk([], $rendered['choices'][0]['finish_reason']) . "data: [DONE]\n\n",
+        'usage' => $canonical['usage'],
+    ];
+}
+
+/**
+ * Forma única do retorno das tentativas, para o loop não adivinhar chaves.
+ * 'network' é um campo próprio em vez de "status === 0": o status devolvido
+ * já vem normalizado para 502 quando não houve resposta HTTP, então inferir
+ * rede pelo status daria sempre falso — foi assim que RETRY_SAME_PROVIDER
+ * ficou sem efeito antes.
+ */
+function provider_result(bool $done, int $status, string $error, string $partial = '', bool $opened = false, bool $network = false, bool $toolCall = false): array
+{
+    return [
+        'done'     => $done,
+        'status'   => $status,
+        'error'    => $error,
+        'partial'  => $partial,
+        'opened'   => $opened,
+        'network'  => $network,
+        'toolCall' => $toolCall,
+    ];
+}
+
+/** Registra a falha no cooldown e no breaker, com a janela que o tipo de erro pede. */
+function mark_failure(array $provider, array $result): void
+{
+    $seconds = failure_cooldown($result);
+    if ($seconds <= 0) {
+        return;
+    }
+    cooldown_mark($provider, $seconds);
+    // Erro de configuração conta inteiro no breaker; falha de rede pura conta
+    // meio, porque costuma ser transitória.
+    breaker_failure($provider, $result['status'] === 0);
 }
 
 // =====================================================================
-// ESTADO OPCIONAL (COOLDOWN E RATE LIMIT)
+// ESTADO OPCIONAL (COOLDOWN, BREAKER E RATE LIMIT)
 // =====================================================================
 
-// Um unico arquivo JSON com flock guarda os dois. Qualquer falha de disco
-// desliga a funcionalidade em silencio: estado aqui e otimizacao, nunca
-// condicao para responder.
+// Um único arquivo JSON com flock guarda os três. Qualquer falha de disco
+// desliga a funcionalidade em silêncio: estado aqui é otimização, nunca
+// condição para responder.
 
 /** Leitura rapida sem lock; JSON truncado durante escrita vira estado vazio. */
 function state_read(): array
@@ -769,19 +1156,29 @@ function state_read(): array
 /** Read-modify-write atomico com flock exclusivo. */
 function state_update(callable $mutator): array
 {
-    $dir = dirname(STATE_FILE);
+    return json_file_update(STATE_FILE, $mutator);
+}
+
+/**
+ * Atualiza um arquivo JSON sob flock exclusivo. Usado pelo estado
+ * (cooldown/breaker/rate limit) e pelas métricas em modo 'file' — as duas
+ * precisam exatamente do mesmo read-modify-write atômico.
+ */
+function json_file_update(string $path, callable $mutator): array
+{
+    $dir = dirname($path);
     if (!is_dir($dir)) {
         @mkdir($dir, 0775, true);
-        // A pasta pode estar dentro do docroot: nega acesso web por dentro tambem.
+        // A pasta pode estar dentro do docroot: nega acesso web por dentro também.
         @file_put_contents($dir . '/.htaccess', "Require all denied\n");
     }
 
-    $handle = @fopen(STATE_FILE, 'c+');
+    $handle = @fopen($path, 'c+');
     if ($handle === false) {
         return [];
     }
-    // Sem lock exclusivo (ex.: NFS sem flock) nao da para escrever com
-    // seguranca: aborta e deixa a funcionalidade desligada em silencio,
+    // Sem lock exclusivo (ex.: NFS sem flock) não dá para escrever com
+    // segurança: aborta e deixa a funcionalidade desligada em silêncio,
     // como prometido no contrato do estado.
     if (!flock($handle, LOCK_EX)) {
         fclose($handle);
@@ -792,14 +1189,17 @@ function state_update(callable $mutator): array
     $state = $mutator($state);
     ftruncate($handle, 0);
     rewind($handle);
-    fwrite($handle, json_encode($state));
+    // JSON_UNESCAPED_UNICODE porque labels de provedor são nomes livres e
+    // podem ter acentos: sem isso o arquivo sai cheio de \uXXXX e fica
+    // difícil de inspecionar na mão.
+    fwrite($handle, json_encode($state, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     fflush($handle);
     flock($handle, LOCK_UN);
     fclose($handle);
     return $state;
 }
 
-/** Identidade estavel do provedor no estado, sem expor url nem chave. */
+/** Identidade estável do provedor no estado, sem expor url nem chave. */
 function provider_key(array $provider): string
 {
     return substr(md5($provider['label'] . '|' . $provider['model']), 0, 12);
@@ -810,15 +1210,15 @@ function cooldown_active(array $provider, array $state): bool
     return ((int) ($state['cooldown'][provider_key($provider)] ?? 0)) > time();
 }
 
-function cooldown_mark(array $provider): void
+function cooldown_mark(array $provider, int $seconds): void
 {
-    if (COOLDOWN_SECONDS <= 0) {
+    if ($seconds <= 0) {
         return;
     }
-    state_update(static function (array $state) use ($provider): array {
+    state_update(static function (array $state) use ($provider, $seconds): array {
         $now = time();
-        $state['cooldown'][provider_key($provider)] = $now + COOLDOWN_SECONDS;
-        // Limpa expirados para o arquivo nao crescer para sempre.
+        $state['cooldown'][provider_key($provider)] = $now + $seconds;
+        // Limpa expirados para o arquivo não crescer para sempre.
         foreach ($state['cooldown'] as $key => $until) {
             if ($until <= $now) {
                 unset($state['cooldown'][$key]);
@@ -829,14 +1229,14 @@ function cooldown_mark(array $provider): void
 }
 
 // ---------------------------------------------------------------------
-// CIRCUIT BREAKER (opcional, alem do cooldown)
+// CIRCUIT BREAKER (opcional, além do cooldown)
 // Estado por provedor em state.json:
-//   breaker[label] = { failures: int, opened_until: int, last_probe: int }
-// Estados: CLOSED (normal) -> OPEN (N falhas consecutivas, fora da rotacao)
-// -> HALF_OPEN (probe periodico: 1 req de teste) -> CLOSED se sucesso.
+//   breaker[chave] = { failures: float, opened_until: int, last_probe: int }
+// Estados: CLOSED (normal) -> OPEN (N falhas consecutivas, fora da rotação)
+// -> HALF_OPEN (probe periódico: 1 req de teste) -> CLOSED se sucesso.
 // ---------------------------------------------------------------------
 
-/** Provedor aberto e fora da janela de probe? Nao entra na rotacao. */
+/** Provedor aberto e fora da janela de probe? Não entra na rotação. */
 function breaker_is_open(array $provider, array $state): bool
 {
     if (BREAKER_FAILURES <= 0) {
@@ -851,17 +1251,14 @@ function breaker_is_open(array $provider, array $state): bool
     $now         = time();
 
     if ($openedUntil > $now) {
-        // Circuito aberto: so permite req de probe no intervalo configurado.
+        // Circuito aberto: só permite req de probe no intervalo configurado.
         return ($now - $lastProbe) < BREAKER_PROBE_SECONDS;
     }
-    // Half-open (janela expirou). Se ja houve um probe recente (last_probe
-    // apos opened_until) que falhou sem reabrir, espera o intervalo antes
+    // Half-open (janela expirou). Se já houve um probe recente (last_probe
+    // após opened_until) que falhou sem reabrir, espera o intervalo antes
     // de permitir outro — sem isto, provedores em half-open seriam
-    // afogados em probes em sequencia sem esperar.
-    if ($lastProbe > $openedUntil && ($now - $lastProbe) < BREAKER_PROBE_SECONDS) {
-        return true;
-    }
-    return false;
+    // afogados em probes em sequência sem esperar.
+    return $lastProbe > $openedUntil && ($now - $lastProbe) < BREAKER_PROBE_SECONDS;
 }
 
 /** Marca sucesso: fecha o circuito e zera falhas. */
@@ -876,51 +1273,59 @@ function breaker_success(array $provider): void
     });
 }
 
-/** Marca falha: acumula (rede pura conta como 0.5) e abre se passar do teto. */
-function breaker_failure(array $provider, bool $networkOnly): void
+/** Marca falha: acumula (rede pura conta como 0.5) e abre se passar do teto. */function breaker_failure(array $provider, bool $networkOnly): void
 {
     if (BREAKER_FAILURES <= 0) {
         return;
     }
     state_update(static function (array $state) use ($provider, $networkOnly): array {
-        $key = provider_key($provider);
+        $key   = provider_key($provider);
         $entry = $state['breaker'][$key] ?? ['failures' => 0, 'opened_until' => 0, 'last_probe' => 0];
-        $entry['failures'] = ($entry['failures'] ?? 0) + ($networkOnly ? 0.5 : 1.0);
+        $entry['failures']  = ($entry['failures'] ?? 0) + ($networkOnly ? 0.5 : 1.0);
         $entry['last_probe'] = time();
         if ($entry['failures'] >= BREAKER_FAILURES) {
             $entry['opened_until'] = time() + BREAKER_OPEN_SECONDS;
-            $entry['failures'] = 0;
+            $entry['failures']     = 0;
         }
         $state['breaker'][$key] = $entry;
         return $state;
     });
 }
 
-/** Janela fixa de um minuto, contador global. Retorna segundos restantes
- *  na janela quando estourado (>=1), ou 0 quando liberado. SDKs que respeitam
- *  o header Retry-After conseguem esperar o tempo certo automaticamente. */
-function rate_limited_seconds(): int
+/**
+ * Janela fixa de um minuto, um contador POR CHAVE do gateway. Retorna os
+ * segundos que faltam para a janela virar quando estourado (>=1), ou 0
+ * quando liberado. Por chave e não global porque, com vários apps no mesmo
+ * gateway, um app em loop não pode consumir a cota dos outros.
+ */
+function rate_limited_seconds(string $bucket): int
 {
     if (RATE_LIMIT_PER_MINUTE <= 0) {
         return 0;
     }
     $window = (int) floor(time() / 60);
 
-    // Leitura rapida sem lock: se ja estourou, devolve 429 sem tocar no
-    // lock. Se ainda ha folga, so entao adquire lock para incrementar —
-    // evita serializar todas as requisicoes num lock global de disco.
-    $snapshot = state_read();
-    if ((int) ($snapshot['rate']['window'] ?? 0) === $window && (int) ($snapshot['rate']['count'] ?? 0) >= RATE_LIMIT_PER_MINUTE) {
+    // Leitura rápida sem lock: se já estourou, devolve 429 sem tocar no
+    // lock. Se ainda há folga, só então adquire lock para incrementar —
+    // evita serializar todas as requisições num lock global de disco.
+    $snapshot = state_read()['rate'][$bucket] ?? [];
+    if ((int) ($snapshot['window'] ?? 0) === $window && (int) ($snapshot['count'] ?? 0) >= RATE_LIMIT_PER_MINUTE) {
         return rate_window_remaining();
     }
 
     $count = 0;
-    state_update(static function (array $state) use ($window, &$count): array {
-        if ((int) ($state['rate']['window'] ?? 0) !== $window) {
-            $state['rate'] = ['window' => $window, 'count' => 0];
+    state_update(static function (array $state) use ($window, $bucket, &$count): array {
+        if ((int) ($state['rate'][$bucket]['window'] ?? 0) !== $window) {
+            $state['rate'][$bucket] = ['window' => $window, 'count' => 0];
         }
-        $state['rate']['count']++;
-        $count = $state['rate']['count'];
+        $count = ++$state['rate'][$bucket]['count'];
+        // Baldes de janelas antigas não servem para nada e o arquivo não
+        // pode crescer a cada chave que já apareceu por aqui.
+        foreach ($state['rate'] as $key => $entry) {
+            if ((int) ($entry['window'] ?? 0) < $window) {
+                unset($state['rate'][$key]);
+            }
+        }
         return $state;
     });
     return $count > RATE_LIMIT_PER_MINUTE ? rate_window_remaining() : 0;
@@ -929,18 +1334,97 @@ function rate_limited_seconds(): int
 /** Segundos ate o fim da janela de 1 minuto atual. */
 function rate_window_remaining(): int
 {
-    $remaining = 60 - (time() % 60);
-    return $remaining > 0 ? $remaining : 1;
+    return max(1, 60 - (time() % 60));
+}
+
+// ---------------------------------------------------------------------
+// COTA DIÁRIA POR PROVEDOR ('rpd' em PROVIDERS)
+// Free tier costuma limitar por requisições/DIA, não por minuto — e o
+// cooldown só reage DEPOIS do 429, quando a requisição já foi queimada.
+// Contando aqui, o provedor sai da fila antes de custar uma tentativa.
+// Estado: quota[chave] = { day: 'Y-m-d', count: int, limit: int }
+// ---------------------------------------------------------------------
+
+/** Identidade da CONTA (label), não do par conta+modelo: a cota é da conta. */
+function quota_key(string $label): string
+{
+    return substr(md5($label), 0, 12);
+}
+
+/** Dia local do servidor — os provedores costumam zerar em UTC, mas o
+ *  contador serve como estimativa conservadora e não como cobrança. */
+function quota_today(): string
+{
+    return gmdate('Y-m-d');
+}
+
+function quota_consume(array $provider): void
+{
+    $limit = (int) ($provider['rpd'] ?? 0);
+    if ($limit <= 0) {
+        return; // provedor sem teto declarado não paga o custo do state_update
+    }
+    state_update(static function (array $state) use ($provider, $limit): array {
+        $key   = quota_key($provider['label']);
+        $today = quota_today();
+        $entry = $state['quota'][$key] ?? [];
+        if (($entry['day'] ?? '') !== $today) {
+            $entry = ['day' => $today, 'count' => 0];
+        }
+        $entry['count'] = (int) ($entry['count'] ?? 0) + 1;
+        $entry['limit'] = $limit;
+        $state['quota'][$key] = $entry;
+
+        // Limpa dias anteriores para o arquivo não crescer para sempre.
+        foreach ($state['quota'] as $other => $data) {
+            if (($data['day'] ?? '') !== $today) {
+                unset($state['quota'][$other]);
+            }
+        }
+        return $state;
+    });
+}
+
+function quota_exhausted(array $provider, array $state): bool
+{
+    $limit = (int) ($provider['rpd'] ?? 0);
+    if ($limit <= 0) {
+        return false;
+    }
+    $entry = $state['quota'][quota_key($provider['label'])] ?? null;
+    return $entry !== null
+        && ($entry['day'] ?? '') === quota_today()
+        && (int) ($entry['count'] ?? 0) >= $limit;
+}
+
+/** Junta o consumo diário ao snapshot de métricas de /health/providers. */
+function quota_annotate(array $snapshot): array
+{
+    $quota = state_read()['quota'] ?? [];
+    $today = quota_today();
+    foreach ($snapshot as $label => $metrics) {
+        $entry = $quota[quota_key((string) $label)] ?? null;
+        if ($entry === null || ($entry['day'] ?? '') !== $today) {
+            continue;
+        }
+        $snapshot[$label]['rpd_used']  = (int) ($entry['count'] ?? 0);
+        $snapshot[$label]['rpd_limit'] = (int) ($entry['limit'] ?? 0);
+    }
+    return $snapshot;
 }
 
 // =====================================================================
-// SAIDA, LOG E UTILITARIOS
+// SAÍDA, LOG E UTILITÁRIOS
 // =====================================================================
 
 function send_json(int $status, array $data): void
 {
-    http_response_code($status);
-    header('Content-Type: application/json; charset=utf-8');
+    // headers_sent() já verdadeiro significa que um stream está aberto:
+    // mexer em status ou Content-Type ali só geraria warning.
+    if (!headers_sent()) {
+        http_response_code($status);
+        header('Content-Type: application/json; charset=utf-8');
+    }
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
 }
 
@@ -950,47 +1434,63 @@ function send_error(int $status, string $type, string $message): void
     send_json($status, ['error' => ['message' => $message, 'type' => $type, 'code' => $status]]);
 }
 
-/** Diz qual provedor atendeu e em que tentativa. Nao expoe a chave. */
-function send_router_headers(array $provider, int $attempt): void
+/** Diz qual provedor atendeu e em que tentativa. Não expõe a chave. */
+function send_router_headers(array $provider, int $attempt, string $servedModel = '', string $requestedModel = ''): void
 {
-    if (!EXPOSE_PROVIDER_HEADER) {
+    if (!EXPOSE_PROVIDER_HEADER || headers_sent()) {
         return;
     }
     header('X-Router-Provider: ' . $provider['label']);
     header('X-Router-Model: ' . $provider['model']);
     header('X-Router-Attempt: ' . $attempt);
+    // MODEL_FALLBACKS troca o modelo por outro quando o pedido falha inteiro.
+    // Isso nunca deve ser silencioso: o app pediu um modelo e recebeu outro.
+    if ($servedModel !== '' && $servedModel !== $requestedModel) {
+        header('X-Router-Fallback: ' . $servedModel);
+    }
 }
 
-/** Uma linha por tentativa. Registra host do provedor, nunca a chave. */
-function log_attempt(string $model, array $provider, int $status, int $ms, string $outcome, string $request_id = ''): void
+/** Uma linha por tentativa. Registra rótulo do provedor, nunca a chave. */
+function log_attempt(string $model, array $provider, int $status, int $ms, string $outcome, string $requestId = '', array $usage = []): void
 {
-    if (LOG_FILE === '') {
-        return;
-    }
-    // Rotaciona antes de crescer demais: o gateway costuma rodar em host
-    // compartilhado. Mantem duas janelas de historico (.1 e .2).
-    if (LOG_MAX_BYTES > 0 && @filesize(LOG_FILE) > LOG_MAX_BYTES) {
-        if (is_file(LOG_FILE . '.1')) {
-            @rename(LOG_FILE . '.1', LOG_FILE . '.2');
+    $tokensIn  = (int) ($usage['input'] ?? 0);
+    $tokensOut = (int) ($usage['output'] ?? 0);
+
+    if (LOG_FILE !== '') {
+        // Rotaciona antes de crescer demais: o gateway costuma rodar em host
+        // compartilhado. Mantém duas janelas de histórico (.1 e .2).
+        if (LOG_MAX_BYTES > 0 && @filesize(LOG_FILE) > LOG_MAX_BYTES) {
+            if (is_file(LOG_FILE . '.1')) {
+                @rename(LOG_FILE . '.1', LOG_FILE . '.2');
+            }
+            @rename(LOG_FILE, LOG_FILE . '.1');
         }
-        @rename(LOG_FILE, LOG_FILE . '.1');
+        // Formato TSV: uma tentativa por linha, direto para cut/awk/grep.
+        // \t e \n saem dos campos livres para não quebrar o alinhamento.
+        // Colunas: data, modelo, provedor, modelo-no-provedor, status, ms,
+        // resultado, request id, tokens de entrada, tokens de saída.
+        // Tokens ficam no fim para não quebrar script que já lê as 8 primeiras.
+        $line = implode("\t", array_map(
+            static fn (string $field): string => strtr($field, ["\t" => ' ', "\n" => ' ', "\r" => '']),
+            [
+                date('c'), $model, $provider['label'], $provider['model'],
+                (string) $status, $ms . 'ms', $outcome, $requestId,
+                (string) $tokensIn, (string) $tokensOut,
+            ]
+        )) . "\n";
+        @file_put_contents(LOG_FILE, $line, FILE_APPEND | LOCK_EX);
     }
 
-    $line = sprintf(
-        "%s\t%s\t%s\t%s\t%d\t%dms\t%s\t%s\n",
-        date('c'),
-        $model,
-        $provider['label'],
-        $provider['model'],
-        $status,
-        $ms,
-        $outcome,
-        $request_id
-    );
-    @file_put_contents(LOG_FILE, $line, FILE_APPEND | LOCK_EX);
+    // Métricas agregadas. Falha silenciosa.
+    metrics_record($model, $provider, $status, $ms, $outcome, $requestId, $tokensIn, $tokensOut);
 
-    // Metricas agregadas (file ou sqlite). Falha silenciosa.
-    metrics_record($model, $provider, $status, $ms, $outcome, $request_id);
+    // log_attempt roda exatamente uma vez por tentativa, então é o lugar
+    // natural do contador diário — que só escreve para quem declarou 'rpd'.
+    // Só conta tentativas que o provedor cobrou (resposta 2xx): falhas de
+    // auth/rede/5xx não entregam resposta e não devem queimar a cota diária.
+    if ($status >= 200 && $status < 300) {
+        quota_consume($provider);
+    }
 }
 
 function new_id(string $prefix): string
@@ -998,88 +1498,21 @@ function new_id(string $prefix): string
     return $prefix . '_' . bin2hex(random_bytes(12));
 }
 
+/**
+ * Reaproveita o X-Request-Id que o cliente mandou, quando ele existe e tem
+ * formato seguro. Assim o mesmo id aparece no log do app e no do gateway, e
+ * um erro deixa de exigir cruzar horário com sorte. Sem cabeçalho, ou com
+ * conteúdo estranho, gera um id próprio.
+ */
+function request_id(): string
+{
+    $sent = trim(server_header('HTTP_X_REQUEST_ID'));
+    return $sent !== '' && strlen($sent) <= 128 && preg_match('/^[A-Za-z0-9._:-]+$/', $sent) === 1
+        ? $sent
+        : new_id('req');
+}
+
 function server_header(string $key): string
 {
     return isset($_SERVER[$key]) ? (string) $_SERVER[$key] : '';
 }
-
-/**
- * Probe ativo: faz uma chamada leve (HEALTH_PROBE_TOKENS) a cada provedor
- * marcado 'probe'=>true em PROVIDERS, respeitando HEALTH_PROBE_INTERVAL
- * via state.json (nao re-probe dentro da janela). Retorna um mapa
- * label => [status, ms, error]. Provedores sem chave sao pulados (o probe
- * so faz sentido para quem tem credenciais validas). A chamada usa o
- * pool de curl e o mesmo call_provider do fluxo normal, entao o que o
- * probe ve e o que o gateway ve de verdade.
- */
-function health_probe(): array
-{
-    $state = state_read();
-    $now   = time();
-    $last  = (int) ($state['health_probe_ts'] ?? 0);
-    if ($now - $last < HEALTH_PROBE_INTERVAL) {
-        return ['skipped' => true, 'reason' => 'interval', 'next_in' => HEALTH_PROBE_INTERVAL - ($now - $last)];
-    }
-    state_update(static function (array $s) use ($now): array {
-        $s['health_probe_ts'] = $now;
-        return $s;
-    });
-
-    $results = [];
-    foreach (PROVIDERS as $name => $catalog) {
-        $probe = $catalog['probe'] ?? false;
-        if (!$probe) {
-            continue;
-        }
-        // Monta um provider sintetico so para o probe: sem chave real se
-        // nao houver (o probe de provedores sem credencial so falharia).
-        $provider = [
-            'url'    => (string) ($catalog['url'] ?? ''),
-            'type'   => (string) ($catalog['type'] ?? 'openai'),
-            'key'    => '',
-            'model'  => '',
-            'label'  => $name,
-        ];
-        // Procura a chave em MODELS: primeira entrada que referencia este
-        // provedor fornece a chave (e o model) para o probe.
-        foreach (MODELS as $config) {
-            $entries = is_array($config['providers'] ?? null) ? $config['providers'] : $config;
-            foreach ($entries as $entry) {
-                if (($entry['provider'] ?? '') === $name) {
-                    $provider['key']   = (string) ($entry['key'] ?? '');
-                    $provider['model'] = (string) ($entry['model'] ?? '');
-                    break 2;
-                }
-            }
-        }
-        if ($provider['key'] === '' || $provider['model'] === '') {
-            $results[$name] = ['status' => 0, 'ms' => 0, 'error' => 'sem chave/modelo configurado'];
-            continue;
-        }
-
-        $probeBody = [
-            'model'       => $provider['model'],
-            'messages'     => [['role' => 'user', 'content' => 'ping']],
-            'max_tokens'   => HEALTH_PROBE_TOKENS,
-            'stream'       => false,
-        ];
-        $probeRequest = normalize_openai_request($probeBody);
-        $payload      = build_payload($probeRequest, $provider);
-
-        $started = microtime(true);
-        $result  = call_provider($provider, $payload, null);
-        $ms      = (int) round((microtime(true) - $started) * 1000);
-        $results[$name] = [
-            'status' => $result['status'],
-            'ms'     => $ms,
-            'error'  => $result['error'] !== '' ? $result['error'] : ($result['status'] === 200 ? '' : upstream_message($result['body'])),
-        ];
-    }
-    return $results;
-}
-
-// Os utilitarios de linha de comando (cli_entry, cli_check, check_params)
-// vivem em src/cli.php, carregado apenas quando PHP_SAPI === 'cli' no
-// index.php. As funcoes puras abaixo continuam aqui porque a web tambem
-// as usa: placeholder_key() (guard_configuration) e resolve_provider()
-// (fluxo principal).
